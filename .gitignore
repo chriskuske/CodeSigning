@@ -3,3 +3,5 @@ logs/*.log
 *.key
 *.pfx
 config.json
+workspace
+.gitignore
