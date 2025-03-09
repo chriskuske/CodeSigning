@@ -1,216 +1,101 @@
-# Azure Code Signing Tool
+# Code Signing Wrapper for Azure Key Vault
 
-A PowerShell-based code signing solution that uses certificates stored in Azure Key Vault, providing a streamlined interface for signing PowerShell scripts, modules, and executables in enterprise environments.
+A PowerShell-based tool for signing code artifacts using certificates stored in Azure Key Vault.
 
 ## Overview
 
-This tool simplifies the code signing process by:
-- Managing connections to Azure Key Vault to access code signing certificates
-- Providing a user-friendly interface for certificate selection
-- Handling batch signing operations with detailed logging
-- Integrating with enterprise SIEM systems for security monitoring
-- Securely managing certificate information for repeated use
+This tool provides a streamlined interface for code signing PowerShell scripts, executables, and various other file types using certificates stored in Azure Key Vault. It handles certificate management, signatures, and verification in one comprehensive solution.
 
-## Prerequisites
+## Features
 
-- Windows PowerShell 5.1 or later
-- Access to an Azure Key Vault containing a code signing certificate
-- Azure Key Vault application credentials (Client ID, Tenant ID)
-- Appropriate permissions to the certificate in Azure Key Vault
+- Sign multiple file types with a single command
+- Store certificate names for quick access
+- Support for recursive directory signing
+- SIEM integration for security logging
+- Certificate management interface
+- Progress tracking with detailed statistics
+- "Remember last certificate" functionality
 
-## Installation
+## Requirements
 
-1. Download and extract the ZIP package to a directory of your choice
-2. Ensure all files are extracted together in the same directory:
-   - `CodeSignWrapper.ps1` (Main script)
-   - `CredentialManager.ps1` (Helper functions)
-   - `AzureSignTool.exe` (Core signing binary)
-   - `config.json` (Configuration file)
+- PowerShell 5.1 or higher
+- Access to an Azure Key Vault with a code signing certificate
+- AzureSignTool.exe (automatically downloaded if not present)
 
-No formal installation is required; the tool operates directly from the extracted location.
+## Supported File Types
 
-## First-Time Setup
+The tool supports signing the following file types:
 
-1. The `config.json` file is pre-configured with organization-wide settings:
-   ```json
-   {
-       "KeyVaultUrl": "https://itss-managed-certs.vault.azure.net/",
-       "DefaultCertificateName": "ITSS-Code-Signing",
-       "ClientId": "c699b1cf-73bd-4896-8dd2-74ea7d99dc60",
-       "TenantId": "e324592a-2653-45c7-9bfc-597c36917127",
-       "TimestampServer": "http://timestamp.digicert.com"
-   }
-   ```
+| Category | File Extensions |
+|----------|----------------|
+| Scripts | .ps1, .psm1, .psd1, .vbs, .js, .wsf |
+| Executables | .exe, .dll, .sys |
+| Installers | .msi, .msp, .msix, .appx |
+| Containers | .msix, .appx, .cab |
 
-2. **Important:** Do not modify the ClientId, TenantId, or TimestampServer values as these are standardized across the organization.
+> **Note on ZIP files:** Standard ZIP files (.zip) cannot be directly signed with Authenticode. To sign files in a ZIP archive, extract them first, sign each file individually, then repackage the ZIP.
 
-3. You only need to update the following if necessary:
-   - `DefaultCertificateName`: Only if you have a different default certificate you prefer to use
+## Usage
 
-3. Test the configuration by running a simple signing operation:
-   ```powershell
-   .\CodeSignWrapper.ps1 -Path "test.ps1"
-   ```
-
-## Basic Usage
-
-### Interactive Mode
-
-Running the script without parameters launches interactive mode:
+### Basic Usage
 
 ```powershell
-.\CodeSignWrapper.ps1
+.\CodeSignWrapper.ps1 -Path "C:\Path\To\File\Or\Directory"
 ```
 
-This will:
-1. Present a menu of available certificates
-2. Prompt for the Key Vault secret
-3. Ask for the file or directory to sign
+### Signing Recursively
 
-### Command-Line Mode
-
-Sign a single file:
 ```powershell
-.\CodeSignWrapper.ps1 -Path "C:\Scripts\MyScript.ps1"
+.\CodeSignWrapper.ps1 -Path "C:\Path\To\Directory" -Recurse
 ```
 
-Sign all supported files in a directory:
+### Forcing Re-signing of Already Signed Files
+
 ```powershell
-.\CodeSignWrapper.ps1 -Path "C:\Scripts" -Recurse
+.\CodeSignWrapper.ps1 -Path "C:\Path\To\File" -Force
 ```
 
-Use a specific certificate:
+### Using a Specific Certificate
+
 ```powershell
-.\CodeSignWrapper.ps1 -Path "C:\Scripts" -CertificateName "MyCertificate"
+.\CodeSignWrapper.ps1 -Path "C:\Path\To\File" -CertificateName "MyCertName"
 ```
 
-Force re-signing of already signed files:
+### Remembering Last Used Certificate
+
 ```powershell
-.\CodeSignWrapper.ps1 -Path "C:\Scripts" -Force
+.\CodeSignWrapper.ps1 -Path "C:\Path\To\File" -RememberCertificate
 ```
 
-## Advanced Usage
+## Environment Variables
 
-### Custom File Patterns
-
-Specify which file types to include:
-```powershell
-.\CodeSignWrapper.ps1 -Path "C:\Scripts" -Include "*.ps1","*.psm1","*.dll"
-```
-
-Exclude specific file patterns:
-```powershell
-.\CodeSignWrapper.ps1 -Path "C:\Scripts" -Recurse -Exclude "*-old.ps1","*-test.ps1"
-```
-
-### Certificate Management
-
-Store a certificate name for quick access:
-```powershell
-# The wrapper will prompt you to save new certificate names
-.\CodeSignWrapper.ps1 -CertificateName "NewCertName" -RememberCertificate
-```
-
-Access the certificate management menu:
-```powershell
-# Run the tool and select "Manage stored certificates" from the menu
-.\CodeSignWrapper.ps1
-```
-
-### Environment Variables
-
-You can use environment variables for non-interactive usage:
-```powershell
-$env:AZURE_CERT_NAME = "MyCertificate"
-$env:AZURE_KEYVAULT_SECRET = "YourSecretValue"  # Handle securely in production
-.\CodeSignWrapper.ps1 -Path "C:\Scripts"
-```
-
-## Configuration Reference
-
-The `config.json` file contains the following settings:
-
-| Setting | Description | Can Modify |
-|---------|-------------|------------|
-| `KeyVaultUrl` | URL of your Azure Key Vault | **NO** - Organization standard |
-| `DefaultCertificateName` | The default certificate to use when none is specified | Yes - based on your needs |
-| `ClientId` | The Azure AD application ID with Key Vault access | **NO** - Organization standard |
-| `TenantId` | Your Azure AD tenant ID | **NO** - Organization standard |
-| `TimestampServer` | The RFC3161 timestamp server URL | **NO** - Organization standard |
-
-**Note:** The ClientId, TenantId, and TimestampServer are standardized across the organization and should not be modified. These values are managed centrally to ensure consistent security policies.
-
-## SIEM Integration
-
-This tool automatically logs all signing activities to the organization's SIEM system in accordance with IT Policy requirements. This integration is:
-
-- Pre-configured in the script
-- Mandatory for compliance and security monitoring
-- Not modifiable by end users
-
-All code signing events will be logged with appropriate metadata for audit purposes.
-
-## Logging
-
-All signing operations are logged to the `logs` directory with timestamps:
-- Success and failure counts
-- Certificate details
-- File information
-- Error messages
-
-Review logs in:
-```
-.\logs\signing_YYYYMMDD_HHMMSS.log
-```
-
-## Security Best Practices
-
-1. **Secret Management**:
-   - Never store Key Vault secrets in plain text files
-   - The tool does not persist secrets between sessions
-   - Consider using a secure secret management solution for automation
-
-2. **Certificate Handling**:
-   - Only store certificate names, not credentials, for repeated use
-   - Regularly rotate certificates following your organization's policy
-   - Use the `-RememberCertificate` option only on trusted workstations
-
-3. **Access Control**:
-   - Limit Azure Key Vault access to necessary users and services
-   - Use separate certificates for different applications or teams
-   - Leverage SIEM integration for auditing all signing operations
+- `AZURE_CERT_NAME` - Set certificate name without interactive prompt
+- `AZURE_KEYVAULT_SECRET` - Set Key Vault secret without interactive prompt
 
 ## Troubleshooting
 
-### Common Issues
+### Common Errors
 
-**Error: "Failed to validate configuration"**
-- Verify Key Vault URL is correct
-- Ensure certificate name exists in the vault
-- Check that the ClientId has GET permissions on certificates and secrets
+| Error | Solution |
+|-------|----------|
+| Configuration validation failed | Check your certificate name and Key Vault secret |
+| Failed to sign ZIP file | ZIP files cannot be directly signed. Extract contents, sign individual files, then repackage |
+| Signature verification failed | Ensure the file type is supported for signing |
 
-**Error: "Access denied to Key Vault"**
-- Verify the secret is correct
-- Check Azure AD application permissions
-- Ensure the certificate exists and hasn't expired
+## Security Considerations
 
-**Error: "AzureSignTool not found"**
-- Ensure AzureSignTool.exe is in the same directory as the wrapper
-- Try running with `-Force` to re-download the binary
+- Key Vault secrets are never saved to disk
+- Certificate operations are logged to SIEM (if enabled)
+- All credential storage is handled securely through Windows Credential Manager
 
-### Debug Mode
+## Example Workflow
 
-For detailed troubleshooting, run in verbose mode:
-```powershell
-$VerbosePreference = 'Continue'
-.\CodeSignWrapper.ps1 -Path "C:\Scripts"
-```
+1. Run the script without parameters: `.\CodeSignWrapper.ps1`
+2. Select your certificate from the menu or enter a new one
+3. Enter the Key Vault secret when prompted
+4. Enter the path to the file or directory to sign
+5. The tool will process and sign all eligible files
 
-## Version Information
+## Log Files
 
-**Version:** 1.0 (March 2025)
-**Author:** Matt Mueller (matthew.mueller@teledyne.com)
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+Logs are saved in the `logs` subdirectory with timestamps for each signing operation.
