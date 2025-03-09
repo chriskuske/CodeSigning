@@ -12,7 +12,7 @@
 
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
-    [Parameter(Mandatory=$false, Position=0)]  # Changed to non-mandatory
+    [Parameter(Mandatory=$false, Position=0)]
     [string]$Path,
     
     [Parameter(Mandatory=$false)]
@@ -47,7 +47,10 @@ param(
     [string]$SIEMProtocol = "TCP",
     
     [Parameter(Mandatory=$false)]
-    [bool]$EnableSIEM = $true  # Changed from [switch] to [bool] with default value of $true
+    [bool]$EnableSIEM = $true,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$RememberCertificate
 )
 
 Begin {
@@ -62,6 +65,7 @@ Begin {
     $ConfigPath = Join-Path $scriptDir "config.json"
     $LogDir = Join-Path $scriptDir "logs"
     $credentialManagerPath = Join-Path $scriptDir "CredentialManager.ps1"
+    $lastUsedCertPath = Join-Path $scriptDir "lastcert.txt"
     
     # Create directories if they don't exist
     if (-not (Test-Path $LogDir)) {
@@ -78,7 +82,7 @@ Begin {
             [string]$Level = "INFO",
             [string]$EventType = "CodeSigning",
             [string]$Action = "",
-            [hashtable]$Properties = @{}
+            [hashtable]$Properties = @{ }
         )
         
         if (-not $EnableSIEM) { return }
@@ -169,7 +173,7 @@ Begin {
             [switch]$Console,
             [string]$EventType = "CodeSigning",
             [string]$Action = "",
-            [hashtable]$Properties = @{}
+            [hashtable]$Properties = @{ }
         )
         $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         $logMessage = "$timestamp [$Level] $Message"
@@ -212,7 +216,7 @@ Begin {
         try {
             @{
                 KeyVaultUrl = "https://itss-managed-certs.vault.azure.net/"
-                DefaultCertificateName = "ITSS-Code-Signing"  # Changed default
+                DefaultCertificateName = "ITSS-Code-Signing"
                 ClientId = "c699b1cf-73bd-4896-8dd2-74ea7d99dc60"
                 TenantId = "e324592a-2653-45c7-9bfc-597c36917127"
                 TimestampServer = "http://timestamp.digicert.com"
@@ -362,126 +366,201 @@ Begin {
         }
     }
 
-    # Load configuration first
-    if (-not (Test-Path $ConfigPath)) {
-        @{
-            KeyVaultUrl = "https://itss-managed-certs.vault.azure.net/"
-            DefaultCertificateName = "ITSS-Code-Signing"  # Only keep this certificate name
-            ClientId = "c699b1cf-73bd-4896-8dd2-74ea7d99dc60"
-            TenantId = "e324592a-2653-45c7-9bfc-597c36917127"
-            TimestampServer = "http://timestamp.digicert.com"
-        } | ConvertTo-Json | Set-Content $ConfigPath
-        Write-Log "Created default configuration at $ConfigPath"
+    function Get-LastUsedCertificate {
+        if (Test-Path $lastUsedCertPath) {
+            return Get-Content $lastUsedCertPath -ErrorAction SilentlyContinue
+        }
+        return $null
     }
-    $config = Get-Content $ConfigPath | ConvertFrom-Json
+    
+    function Set-LastUsedCertificate {
+        param([string]$CertName)
+        
+        if ($RememberCertificate -and -not [string]::IsNullOrWhiteSpace($CertName)) {
+            $CertName | Out-File $lastUsedCertPath -Force
+        }
+    }
 
-    # Add config validation
-    if (-not $config.KeyVaultUrl -or -not $config.ClientId -or -not $config.TenantId) {
-        throw "Configuration file is missing required values. Please check $ConfigPath"
+    # Enhanced certificate selection with visual menu
+    function Select-Certificate {
+        # Get stored certificates first
+        $storedCerts = @(cmdkey /list | Select-String "CodeSigning_" | ForEach-Object {
+            $_.ToString() -replace ".*CodeSigning_", ""
+        })
+        
+        $lastUsed = Get-LastUsedCertificate
+        
+        # Create options array with padding for better display
+        $options = @()
+        # Fix: Chain Math::Max calls to handle multiple values
+        $maxLength = [Math]::Max(
+            [Math]::Max(
+                $config.DefaultCertificateName.Length,
+                ($storedCerts | Measure-Object -Maximum -Property Length).Maximum
+            ),
+            [Math]::Max(
+                "Enter different name".Length,
+                "Manage stored certificates".Length
+            )
+        ) + 5
+        
+        Write-Host "`n┌$("─" * ($maxLength + 6))┐" -ForegroundColor Cyan
+        Write-Host "│  Certificate Selection Menu  │" -ForegroundColor Cyan
+        Write-Host "└$("─" * ($maxLength + 6))┘" -ForegroundColor Cyan
+        
+        # Default certificate option
+        $defaultLabel = "$($config.DefaultCertificateName) (Default)"
+        if ($config.DefaultCertificateName -eq $lastUsed) {
+            $defaultLabel += " [Last Used]"
+        }
+        Write-Host "  [1] " -ForegroundColor Yellow -NoNewline
+        Write-Host $defaultLabel
+        $options += $config.DefaultCertificateName
+
+        # Last used certificate if different from default
+        if ($lastUsed -and $lastUsed -ne $config.DefaultCertificateName) {
+            Write-Host "  [2] " -ForegroundColor Yellow -NoNewline
+            Write-Host "$lastUsed [Last Used]"
+            $options += $lastUsed
+            $startIdx = 3
+        } else {
+            $startIdx = 2
+        }
+        
+        # Stored certificates
+        $certIdx = $startIdx
+        foreach ($cert in $storedCerts) {
+            # Skip if already listed as default or last used
+            if ($cert -eq $config.DefaultCertificateName -or $cert -eq $lastUsed) {
+                continue
+            }
+            Write-Host "  [$certIdx] " -ForegroundColor Yellow -NoNewline
+            Write-Host $cert
+            $options += $cert
+            $certIdx++
+        }
+        
+        # Additional options
+        Write-Host "  [$certIdx] " -ForegroundColor Yellow -NoNewline
+        Write-Host "Enter different name"
+        $enterDiffIdx = $certIdx
+        $certIdx++
+        
+        Write-Host "  [$certIdx] " -ForegroundColor Yellow -NoNewline
+        Write-Host "Manage stored certificates" -ForegroundColor Cyan
+        $manageIdx = $certIdx
+        
+        $choice = Read-Host "`nSelect option (1-$certIdx)"
+        
+        # Handle numeric choice
+        if ([int]::TryParse($choice, [ref]$null)) {
+            $choiceNum = [int]$choice
+            
+            # Direct certificate selection
+            if ($choiceNum -ge 1 -and $choiceNum -lt $enterDiffIdx) {
+                $selectedCert = $options[$choiceNum - 1]
+                Set-LastUsedCertificate -CertName $selectedCert
+                return $selectedCert
+            }
+            # Enter different name
+            elseif ($choiceNum -eq $enterDiffIdx) {
+                $inputName = Read-Host "Enter certificate name"
+                if ([string]::IsNullOrWhiteSpace($inputName)) {
+                    Write-Host "Using default certificate" -ForegroundColor Yellow
+                    Set-LastUsedCertificate -CertName $config.DefaultCertificateName
+                    return $config.DefaultCertificateName
+                }
+                
+                # Prompt to store if this is a new certificate name
+                if ($inputName -notin $storedCerts -and $inputName -ne $config.DefaultCertificateName) {
+                    $saveChoice = Read-Host "Do you want to save this certificate name for future use? (Y/N)"
+                    if ($saveChoice -eq 'Y') {
+                        Save-CodeSigningCredential -CertificateName $inputName -Secret (New-Object SecureString)
+                    }
+                }
+                
+                Set-LastUsedCertificate -CertName $inputName
+                return $inputName
+            }
+            # Manage certificates
+            elseif ($choiceNum -eq $manageIdx) {
+                Show-CertificateManager
+                return (Select-Certificate) # Recursive call for new selection
+            }
+        }
+        
+        # Default fallback
+        Write-Host "Invalid selection. Using default certificate." -ForegroundColor Yellow
+        Set-LastUsedCertificate -CertName $config.DefaultCertificateName
+        return $config.DefaultCertificateName
+    }
+    
+    function Show-CertificateManager {
+        $storedCerts = @(cmdkey /list | Select-String "CodeSigning_" | ForEach-Object {
+            $_.ToString() -replace ".*CodeSigning_", ""
+        })
+        
+        Write-Host "`n┌$("─" * 30)┐" -ForegroundColor Cyan
+        Write-Host "│  Certificate Management  │" -ForegroundColor Cyan
+        Write-Host "└$("─" * 30)┘" -ForegroundColor Cyan
+        Write-Host "  [1] " -ForegroundColor Yellow -NoNewline
+        Write-Host "List stored certificates"
+        Write-Host "  [2] " -ForegroundColor Yellow -NoNewline
+        Write-Host "Remove stored certificate"
+        Write-Host "  [3] " -ForegroundColor Yellow -NoNewline
+        Write-Host "Back to certificate selection"
+        
+        $mgmtChoice = Read-Host "`nSelect option (1-3)"
+        
+        switch ($mgmtChoice) {
+            "1" {
+                Write-Host "`n┌ Stored Certificates ┐" -ForegroundColor Cyan
+                if ($storedCerts) {
+                    foreach ($cert in $storedCerts) {
+                        Write-Host "  - $cert"
+                    }
+                } else {
+                    Write-Host "  (No stored certificates)" -ForegroundColor Gray
+                }
+                
+                Write-Host "`nPress Enter to continue..." -ForegroundColor Yellow
+                Read-Host | Out-Null
+                return
+            }
+            "2" {
+                if ($storedCerts) {
+                    Write-Host "`nSelect certificate to remove:" -ForegroundColor Yellow
+                    for ($i = 0; $i -lt $storedCerts.Count; $i++) {
+                        Write-Host "  [$($i + 1)] $($storedCerts[$i])"
+                    }
+                    
+                    $removeChoice = Read-Host "`nEnter number (or 'C' to cancel)"
+                    
+                    if ($removeChoice -ne 'C' -and [int]::TryParse($removeChoice, [ref]$null)) {
+                        $index = [int]$removeChoice - 1
+                        if ($index -ge 0 -and $index -lt $storedCerts.Count) {
+                            Remove-CodeSigningCredential -CertificateName $storedCerts[$index]
+                            Write-Host "Certificate removed successfully" -ForegroundColor Green
+                        }
+                    }
+                } else {
+                    Write-Host "`nNo stored certificates to remove." -ForegroundColor Yellow
+                }
+                
+                Write-Host "`nPress Enter to continue..." -ForegroundColor Yellow
+                Read-Host | Out-Null
+                return
+            }
+            default {
+                return
+            }
+        }
     }
 
     $azureSignToolPath = Get-AzureSignTool
 
     # Modified certificate selection with management options
     if (-not $CertificateName) {
-        function Select-Certificate {
-            # Get stored certificates first
-            $storedCerts = @(cmdkey /list | Select-String "CodeSigning_" | ForEach-Object {
-                $_.ToString() -replace ".*CodeSigning_", ""
-            })
-
-            Write-Host "`nSelect certificate:"
-            Write-Host "1. $($config.DefaultCertificateName) (Default)"
-            if ($storedCerts.Count -gt 0) {
-                Write-Host "2. Select from stored certificates"
-            }
-            Write-Host "3. Enter different name"
-            Write-Host "4. Manage stored certificates"
-
-            $choice = Read-Host "> "
-            
-            switch ($choice) {
-                "1" { return $config.DefaultCertificateName }
-                "2" { 
-                    if ($storedCerts.Count -gt 0) {
-                        Write-Host "`nStored certificates:"
-                        for ($i = 0; $i -lt $storedCerts.Count; $i++) {
-                            Write-Host "$($i + 1). $($storedCerts[$i])"
-                        }
-                        $certChoice = Read-Host "`nSelect certificate number"
-                        if ([int]::TryParse($certChoice, [ref]$null)) {
-                            $index = [int]$certChoice - 1
-                            if ($index -ge 0 -and $index -lt $storedCerts.Count) {
-                                return $storedCerts[$index]
-                            }
-                        }
-                        Write-Host "Invalid selection. Using default certificate."
-                        return $config.DefaultCertificateName
-                    }
-                    Write-Host "No stored certificates found."
-                    return $config.DefaultCertificateName
-                }
-                "3" { 
-                    $inputName = Read-Host "Enter certificate name"
-                    if ([string]::IsNullOrWhiteSpace($inputName)) {
-                        Write-Host "Using default certificate"
-                        return $config.DefaultCertificateName
-                    }
-                    # Only prompt to store if this is a new certificate name
-                    if ($inputName -notin $storedCerts -and $inputName -ne $config.DefaultCertificateName) {
-                        $saveChoice = Read-Host "Do you want to save this certificate name for future use? (Y/N)"
-                        if ($saveChoice -eq 'Y') {
-                            Save-CodeSigningCredential -CertificateName $inputName -Secret (New-Object SecureString)
-                        }
-                    }
-                    return $inputName
-                }
-                "4" { # Certificate Management
-                    Write-Host "`nCertificate Management:"
-                    Write-Host "1. List stored certificates"
-                    Write-Host "2. Remove stored certificate"
-                    Write-Host "3. Back to certificate selection"
-                    
-                    $mgmtChoice = Read-Host "> "
-                    switch ($mgmtChoice) {
-                        "1" {
-                            Write-Host "`nStored certificates:"
-                            if ($storedCerts) {
-                                $storedCerts | ForEach-Object { Write-Host " - $_" }
-                            } else {
-                                Write-Host " (none)"
-                            }
-                            Write-Host ""
-                            return (Select-Certificate) # Recursive call for new selection
-                        }
-                        "2" {
-                            if ($storedCerts) {
-                                Write-Host "`nSelect certificate to remove:"
-                                for ($i = 0; $i -lt $storedCerts.Count; $i++) {
-                                    Write-Host "$($i + 1). $($storedCerts[$i])"
-                                }
-                                $removeChoice = Read-Host "`nEnter number"
-                                if ([int]::TryParse($removeChoice, [ref]$null)) {
-                                    $index = [int]$removeChoice - 1
-                                    if ($index -ge 0 -and $index -lt $storedCerts.Count) { # Fixed syntax error here
-                                        Remove-CodeSigningCredential -CertificateName $storedCerts[$index]
-                                    }
-                                }
-                            } else {
-                                Write-Host "`nNo stored certificates to remove."
-                            }
-                            return (Select-Certificate) # Recursive call for new selection
-                        }
-                        default {
-                            return (Select-Certificate) # Recursive call for new selection
-                        }
-                    }
-                }
-                default { return $config.DefaultCertificateName }
-            }
-        }
-
-        # Replace null coalescing with if-else
         $CertificateName = if ($env:AZURE_CERT_NAME) {
             $env:AZURE_CERT_NAME
         } else {
@@ -508,7 +587,7 @@ Begin {
     $testArgs = @(
         "sign",
         "--quiet",
-        "--continue-on-error",  # Add continue-on-error flag
+        "--continue-on-error",
         "--kvu", $config.KeyVaultUrl,
         "--kvc", $CertificateName,
         "--azure-key-vault-client-id", $config.ClientId,
@@ -516,7 +595,7 @@ Begin {
         "--kvs", $env:AZURE_KEYVAULT_SECRET,
         "--timestamp-rfc3161", $config.TimestampServer,
         "--help",
-        "--quiet"  # Add quiet flag
+        "--quiet"
     )
 
     $null = Start-Process -FilePath $azureSignToolPath -ArgumentList $testArgs -NoNewWindow -Wait -PassThru -RedirectStandardError "$LogDir\stderr.txt"
@@ -534,36 +613,28 @@ Begin {
         }
         Remove-Item "$LogDir\stderr.txt"
     }
+    
     $configSuccessData = @{
         "KeyVaultUrl" = $config.KeyVaultUrl
         "CertificateName" = $CertificateName
     }
     Write-Log -Message "Configuration validated successfully" -Level SUCCESS -Console -EventType "CodeSigning" -Action "ConfigValidationSuccess" -Properties $configSuccessData
 
-    # Now prompt for file path if not provided
+    # Now prompt for file path if not provided using command-line input instead of GUI
     if (-not $Path) {
         $Path = Read-Host "Enter path to file or directory to sign"
+        
+        # If user entered empty path, exit gracefully
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            Write-Host "No path provided. Operation canceled." -ForegroundColor Yellow
+            exit 0
+        }
     }
 
     # Validate path
     if (-not (Test-Path $Path)) {
         throw "The specified path '$Path' does not exist"
     }
-
-    # Modified tool validation to be quieter
-    Write-Log "Validating Azure Sign Tool..." -Console
-    $testArgs = @(
-        "sign",
-        "--quiet",
-        "--continue-on-error",  # Add continue-on-error flag
-        "--help"
-    )
-    
-    $null = Start-Process -FilePath $azureSignToolPath -ArgumentList $testArgs -NoNewWindow -Wait -PassThru -RedirectStandardError "$LogDir\stderr.txt" -RedirectStandardOutput "$LogDir\stdout.txt"
-    
-    # Remove the help output files
-    if (Test-Path "$LogDir\stderr.txt") { Remove-Item "$LogDir\stderr.txt" }
-    if (Test-Path "$LogDir\stdout.txt") { Remove-Item "$LogDir\stdout.txt" }
 }
 
 Process {
@@ -575,8 +646,8 @@ Process {
             # Try to verify with quiet mode
             $testArgs = @(
                 "sign",
-                "--quiet",  # Add quiet flag
-                "--continue-on-error",  # Add continue-on-error flag
+                "--quiet",
+                "--continue-on-error",
                 "--kvu", $config.KeyVaultUrl,
                 "--kvc", $CertificateName,
                 "--azure-key-vault-client-id", $config.ClientId,
@@ -628,8 +699,20 @@ Process {
         $stats.Total = @($files).Count
         Write-Log "Found $($stats.Total) files to process" -Console
         
+        # Add progress bar and counters
+        $activity = "Signing files with certificate '$CertificateName'"
+        $fileCounter = 0
+        
         foreach ($file in $files) {
             try {
+                $fileCounter++
+                $progressPercent = [Math]::Min(($fileCounter / $stats.Total * 100), 100)
+                
+                # Update progress bar with detailed status
+                $status = "Processing file $fileCounter of $($stats.Total): $($file.Name)"
+                $statusDetail = "Success: $($stats.Success) | Failed: $($stats.Failed) | Skipped: $($stats.Skipped)"
+                Write-Progress -Activity $activity -Status $status -PercentComplete $progressPercent -CurrentOperation $statusDetail
+                
                 Write-Log "Processing: $($file.FullName)" -Console
                 
                 # Get pre-signing certificate info if exists
@@ -642,14 +725,14 @@ Process {
                 $signArgs = @(
                     "sign",
                     "--quiet",
-                    "--continue-on-error",  # Add continue-on-error flag
+                    "--continue-on-error",
                     "--kvu", $config.KeyVaultUrl,
                     "--kvc", $CertificateName,
                     "--azure-key-vault-client-id", $config.ClientId,
                     "--azure-key-vault-tenant-id", $config.TenantId,
                     "--kvs", $env:AZURE_KEYVAULT_SECRET,
                     "--timestamp-rfc3161", $config.TimestampServer,
-                    "--colors",  # Add colors for better error visibility
+                    "--colors",
                     $file.FullName
                 )
 
@@ -688,14 +771,6 @@ Process {
                         $successMessage = "Successfully signed file '$($file.Name)' using certificate '$CertificateName' ($($sig.SignerCertificate.Thumbprint))"
                         Write-Log $successMessage -Level SUCCESS -Console -Properties $signingDetails
                         
-                        # For console display only, not sent to SIEM as separate entries
-                        if ($VerbosePreference -eq 'Continue') {
-                            Write-Host "Certificate details:" -ForegroundColor Cyan
-                            Write-Host " - Subject: $($sig.SignerCertificate.Subject)" -ForegroundColor Cyan  
-                            Write-Host " - Issuer: $($sig.SignerCertificate.Issuer)" -ForegroundColor Cyan
-                            Write-Host " - Valid until: $($sig.SignerCertificate.NotAfter)" -ForegroundColor Cyan
-                        }
-                        
                         $stats.Success++
                     } else {
                         throw "Signature verification failed: $($sig.Status). StatusMessage: $($sig.StatusMessage)"
@@ -726,6 +801,9 @@ Process {
                 continue
             }
         }
+        
+        # Clear the progress bar when done
+        Write-Progress -Activity $activity -Completed
     }
     finally {
         if (Test-Path "$LogDir\stderr.txt") { Remove-Item "$LogDir\stderr.txt" -Force }
@@ -775,18 +853,23 @@ End {
                     "CompletedAt" = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
                 }
     
-    # Console display only
-    Write-Host "`nSigning operation completed:" -ForegroundColor Cyan
-    Write-Host "Total files processed: $($stats.Total)" -ForegroundColor Cyan
-    Write-Host "Successfully signed: $($stats.Success)" -ForegroundColor Green
-    Write-Host "Failed to sign: $($stats.Failed)" -ForegroundColor $(if ($stats.Failed -gt 0) {"Red"} else {"Gray"})
-    Write-Host "Skipped: $($stats.Skipped)" -ForegroundColor Gray
+    # Enhanced console display with border
+    $border = "═" * 50
+    Write-Host "`n╔$border╗" -ForegroundColor Cyan
+    Write-Host "║ Signing Operation Summary                          ║" -ForegroundColor Cyan
+    Write-Host "╠$border╣" -ForegroundColor Cyan
+    Write-Host "║ Certificate: $($CertificateName.PadRight(36))║" -ForegroundColor Cyan
+    Write-Host "║ Total files processed: $($stats.Total.ToString().PadRight(26))║" -ForegroundColor Cyan
+    Write-Host "║ Successfully signed: $($stats.Success.ToString().PadRight(28))║" -ForegroundColor Green
+    Write-Host "║ Failed to sign: $($stats.Failed.ToString().PadRight(32))║" -ForegroundColor $(if ($stats.Failed -gt 0) {"Red"} else {"Gray"})
+    Write-Host "║ Skipped: $($stats.Skipped.ToString().PadRight(39))║" -ForegroundColor Gray
+    Write-Host "╚$border╝" -ForegroundColor Cyan
 }
 # SIG # Begin signature block
 # MIIvUAYJKoZIhvcNAQcCoIIvQTCCLz0CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCJkRMcTEW962YR
-# SY0EBO3ei6dyccDE1pmIRqLc3aLQjaCCFDkwggWQMIIDeKADAgECAhAFmxtXno4h
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCkL5+2c/GZ04yZ
+# vYmeDPq0NY8AXImHFwtl9BcuYzgw4aCCFDkwggWQMIIDeKADAgECAhAFmxtXno4h
 # MuI5B72nd3VcMA0GCSqGSIb3DQEBDAUAMGIxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xITAfBgNV
 # BAMTGERpZ2lDZXJ0IFRydXN0ZWQgUm9vdCBHNDAeFw0xMzA4MDExMjAwMDBaFw0z
@@ -899,23 +982,23 @@ End {
 # dGVkIEc0IENvZGUgU2lnbmluZyBSU0E0MDk2IFNIQTM4NCAyMDIxIENBMQIQAYNB
 # wGfl8Kv8z9hk6MooZzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3AgEMMQow
 # CKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisGAQQBgjcC
-# AQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCDk/p0fT4fd3JPnIEj
-# prAggmbDd0ApxNyEstmpuAeR9DANBgkqhkiG9w0BAQEFAASCAgBW5/cU44rEZaNB
-# 6naWRN+AfEFi1em4kC/gdYYukDbkKtcPK3EMikrOQH5Od11wJvKEJ8+JuwWFAn7i
-# zEj8Z2AMQFCduoBHK5kwaZbETbSkFLgM/WipRPbuRZp6Y741JT2NvnSXjpDOpqi1
-# V2erXy1cf7ab9ElevPzQ7wNNVWNYMTuCr8Dm1Qdrc8fKMItiXwxjCq6YznI0+aMN
-# k97t3U7g6VnqaE+9dVkUL81Mqm91Vk3CPrfdjbNvYXXkVcy7N5PTZ0E7RYwN0ADu
-# 1F8aVgcKLz/gkQRp25vGdbYWkod6ZZUjneErpTwKfDk8uvrB1IizLQj6pKb97KNq
-# otdcj1yYTGcosJOSt8dG9xVqM7DNI3UdT51RRuVUAvTPC+97gUSlMGk/1ikOg82/
-# kkZlyAUSjzGoJM6ml5XiaLWGX8+6OTk5wAMh0v62/HUbs1VA5bWHMKHvjkmmxaTV
-# jijyP8NY4M2mylgVtthPREoznDxNLHCtPPAw0OzAl1avj7Amn1TzV3qPWF3Si3vq
-# DsGUfSq/XcV9ymXUaMA+5CNZgpdWFxy7LaSdPzvPfyw91WqTvsus+QjD6lXEllfb
-# miXnaTGYk1hTFM7zwGgY7/ehKDo7rhfk8xBfZZmzNueiNJP7zpo1Bhc2ieYzHxq+
-# 105DNaVYbiRlSdAnP6/all0XjvoexqGCFzowghc2BgorBgEEAYI3AwMBMYIXJjCC
+# AQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBDPsGysqlJIEWcz/Zd
+# fLxXOHJdFt6so5BrS9/SK2l+HTANBgkqhkiG9w0BAQEFAASCAgA6FM+oG/7B+1Vx
+# D3HTSxJxRwzQF0o7y3aoka1SNnh67avSpmkeo17fLCp1nA2hgd2Hkyhx0K0dZAwM
+# 7cOwsRSQvdLQekMMqmDsoT/ypTsZF/JGH7NDKld0mvRuR+P7nqx+1wM77wtVx1Lv
+# ijgGUaaEd6mbhHxv0s1mMRXaohDAIsMNA9a9Ypb8NwleUwST/HccP1Xk0EN1TUbv
+# rTBxl7GpQVAwquPvIdFyZspIevCWE2oTr8Cb1+DQrNiA/6ae/r6sfN/LLVonHb37
+# 5epkDSG7gJfC5XiOwtNGj43Ig/chUd0vBteyqJnk/QO7Vu7rsrM9D//TqDqCFK3P
+# wv/D4S0Ei6Xc6AK+9lqiAfMYqMYq8jnRoVZb+MMMovoy565kPm7I5Gknn2Sfcxtv
+# FpRx+whFFi5bM3kCXYxDoAUAKenSOiqZJi853q9FQao3ojHH06+FbA0HHTbJdBiW
+# 22q1SRcFQpbomdrm2qdCuf2Wl0BKpInie/r/v2nXh7H4RJicTv/8clAf9xnQToHa
+# DhLYSyoOtoDP4O2UM4MVJN/og0q7z5SK6/Q9evec8F4G00h+YvSiSzIO0sdpRu7B
+# 62FQJGYa7CTmp9809cKtLXeOOZa+6eGIyasH6vgnI5jNsjfZx8Ea/5ZLIVyylPVy
+# 8U/QYiyxPh/gXsUZqmuIjnhmH99ju6GCFzowghc2BgorBgEEAYI3AwMBMYIXJjCC
 # FyIGCSqGSIb3DQEHAqCCFxMwghcPAgEDMQ8wDQYJYIZIAWUDBAIBBQAweAYLKoZI
-# hvcNAQkQAQSgaQRnMGUCAQEGCWCGSAGG/WwHATAxMA0GCWCGSAFlAwQCAQUABCAR
-# 1JU7WDgLueXXhUpUxBEVoAieLyXBCEknxFjLfRzBcgIRAJ/LCAozZWssvyFZ1rcR
-# CjsYDzIwMjUwMzA1MTQ1MDA2WqCCEwMwgga8MIIEpKADAgECAhALrma8Wrp/lYfG
+# hvcNAQkQAQSgaQRnMGUCAQEGCWCGSAGG/WwHATAxMA0GCWCGSAFlAwQCAQUABCD5
+# 3Jn0nZazHXnXxfPr1dlLDEyFWtFulLH9BW4ejBzTvgIRAI5wDRaSr8MZNchKxHMD
+# x0kYDzIwMjUwMzA5MjIyNDU4WqCCEwMwgga8MIIEpKADAgECAhALrma8Wrp/lYfG
 # +ekE4zMEMA0GCSqGSIb3DQEBCwUAMGMxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5E
 # aWdpQ2VydCwgSW5jLjE7MDkGA1UEAxMyRGlnaUNlcnQgVHJ1c3RlZCBHNCBSU0E0
 # MDk2IFNIQTI1NiBUaW1lU3RhbXBpbmcgQ0EwHhcNMjQwOTI2MDAwMDAwWhcNMzUx
@@ -1021,19 +1104,19 @@ End {
 # OzA5BgNVBAMTMkRpZ2lDZXJ0IFRydXN0ZWQgRzQgUlNBNDA5NiBTSEEyNTYgVGlt
 # ZVN0YW1waW5nIENBAhALrma8Wrp/lYfG+ekE4zMEMA0GCWCGSAFlAwQCAQUAoIHR
 # MBoGCSqGSIb3DQEJAzENBgsqhkiG9w0BCRABBDAcBgkqhkiG9w0BCQUxDxcNMjUw
-# MzA1MTQ1MDA2WjArBgsqhkiG9w0BCRACDDEcMBowGDAWBBTb04XuYtvSPnvk9nFI
-# UIck1YZbRTAvBgkqhkiG9w0BCQQxIgQgpkrX+isNEuOw5ZfEMvoAyp5aYyo4M+Vg
-# ask1mb3NxJIwNwYLKoZIhvcNAQkQAi8xKDAmMCQwIgQgdnafqPJjLx9DCzojMK7W
-# VnX+13PbBdZluQWTmEOPmtswDQYJKoZIhvcNAQEBBQAEggIAiLkbS9gMKRR8QEau
-# w4vH2NOR6kFoRuiHVTws+n/9KK6u+gUce3rf70+j/IY073gTh+M2CtE809+DBIO5
-# C+oyO26JFWyrT+QjjYteH1ULvGot3iIemIiup0sKiuIwJfMuOezi5iEdAdlmZpd/
-# JTOOJnheofApAOLBaSx2uMk/bUJXo6U0Pq8KOj7JxM3oXn8Ay+uRWTXVkpkgL4bx
-# oMLKla53Hwz2lWX7YFb5HCpB3iFIqyiHIMesYD7zrDGxnUQg0gSem7wH01/xKwrx
-# hJdO3oxGLFHgANdZ4WpspFyDpSUfQTE03k7eftShE/tdO2GLaAdw+z58ZcMa35Pd
-# IOM/gQY+34918aFZ+qZOg+BPTwVI/c7jFN/zoVDHmKlLKh9Z8mSVagbODZrNjfxA
-# rRBBSvbcYFav7EVtCK8KAbtZr6JkU5D2BGRhOpxUNJPT3wyuI7AFzNa7BWDUoVRP
-# zyfEYKFH839G0b1XRJQW3KTcV7jCvQ2OEpUTBgP1qzIbqAA4w6OtqUGP4/5AmOe8
-# PZbONHz2EQWcPehX3X6Oh9CmxhUCGMC78XQ/pco4w4lwOWobO12fq6/bzLrWYbxB
-# 8UF9yGOIFuoiK0WOD+3/cJKj+NPQp/dEAhJz8s3jD1OY00d4Q5WSI0BmFziUMQGR
-# Ajdc/AJ9duhHWekysm5CgiVBcN4=
+# MzA5MjIyNDU4WjArBgsqhkiG9w0BCRACDDEcMBowGDAWBBTb04XuYtvSPnvk9nFI
+# UIck1YZbRTAvBgkqhkiG9w0BCQQxIgQgUNbmaebLcAU3W9aG4RUJnp3hNcCoRfp4
+# 5OEhAfHt+mQwNwYLKoZIhvcNAQkQAi8xKDAmMCQwIgQgdnafqPJjLx9DCzojMK7W
+# VnX+13PbBdZluQWTmEOPmtswDQYJKoZIhvcNAQEBBQAEggIADyHAIgj7sungrhUn
+# Jz55/AJkDx6gLAcsUGRRyE4b+izSTguA3bngA29hiCgVNytR2RqKaKihCRHvXIgC
+# /vLtCMftbQVFyJ1co7VIl6rVXz4Ac/DxdXfblVWziSENag0MlGfD7yBKA6nDuP1y
+# p291ptSf5S4TwQOiOAxsDCCol3s/ltE6uGfUV6GGIIGOu/1eZThFfuOKxcDhyt1q
+# yLxMMtYPzBArgtk1yuautq40nWMeGDBvdtudJ76K6LkvQ6elBi0JTF/QS7FQLhBW
+# EdN6oCkVcwdAfSQOoJrYZwZbIG9q7Zi6PHB4jvxT/1uo+irfShNWeIbOrhteX7RZ
+# kEETsTSYTqi0mJflXrALHpCUel7Ws3j5R3yUlnNJN9iua4zxQx3ghwVFClmypKT3
+# Xngvt34hy4gFzigrFFW2J2TEq/52BVWWcGqJNHTzysLvs6ZEuaxMlEv5SCc2qwxa
+# 6B2MlXsvyR4Ja6exVvqqBxe8F7CPeqLk3KIPWPNFF9ScrF2RQ2dyBc1hDv8zbO03
+# 40gl9TouWoYvbkbW3flCUMEA9KXTUBjXlclDLtvCcXMBhtFPXIASuf+glyt8Qwmi
+# jn5LWw97JuewSBtOHshyOQfadH0rmRBM/LNZNDxVcDR0bU7nFZ61VvPFJ2jhyuI9
+# HwYOHQWb5ean0s1WlgHprkhKUfY=
 # SIG # End signature block
