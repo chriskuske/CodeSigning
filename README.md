@@ -20,7 +20,7 @@ This tool provides a streamlined interface for code signing PowerShell scripts, 
 
 - PowerShell 5.1 or higher
 - Access to an Azure Key Vault with a code signing certificate
-- AzureSignTool.exe (automatically downloaded if not present)
+- AzureSignTool-x64.exe v6.0.1 (automatically downloaded if not present)
 
 ## Supported File Types
 
@@ -81,6 +81,8 @@ The tool supports signing the following file types:
 | Configuration validation failed | Check your certificate name and Key Vault secret |
 | Failed to sign ZIP file | ZIP files cannot be directly signed. Extract contents, sign individual files, then repackage |
 | Signature verification failed | Ensure the file type is supported for signing |
+| AzureSignTool authentication failed | Verify your Key Vault permissions and secret values are correct |
+| AzureSignTool not found | The tool will automatically download v6.0.1 x64 version, but may fail if internet access is restricted |
 
 ## Security Considerations
 
