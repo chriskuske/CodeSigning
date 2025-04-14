@@ -206,7 +206,7 @@ Begin {
     # Check for required files
     $requiredFiles = @(
         @{Name = "CredentialManager.ps1"; Path = $credentialManagerPath},
-        @{Name = "AzureSignTool.exe"; Path = (Join-Path $scriptDir "AzureSignTool.exe")}
+        @{Name = "AzureSignTool-x64.exe"; Path = (Join-Path $scriptDir "AzureSignTool-x64.exe")}
     )
 
     foreach ($file in $requiredFiles) {
@@ -262,27 +262,22 @@ Begin {
             or returning the path if it exists. Handles architecture detection
             and backup/restore during updates.
         .OUTPUTS
-            String containing the path to AzureSignTool.exe
+            String containing the path to AzureSignTool-x64.exe
         #>
-        $toolPath = "$PSScriptRoot\AzureSignTool.exe"
+        $toolPath = "$PSScriptRoot\AzureSignTool-x64.exe"
         if ((Test-Path $toolPath) -and (-not $Force)) { return $toolPath }
 
         try {
             Write-Log "Downloading Azure Sign Tool..." -Console
-            # Replace ternary with if-else
-            $arch = if ([System.Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITECTURE") -eq "AMD64") {
-                "x64"
-            } else {
-                "arm64"
-            }
-            $url = "https://github.com/vcsjones/AzureSignTool/releases/download/v6.0.0/AzureSignTool-$arch.exe"
+            # Always use the x64 version as specified
+            $url = "https://github.com/vcsjones/AzureSignTool/releases/download/v6.0.1/AzureSignTool-x64.exe"
             
             if (Test-Path $toolPath) { Copy-Item $toolPath "$toolPath.backup" -Force }
             
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             Invoke-WebRequest -Uri $url -OutFile $toolPath
             if (Test-Path "$toolPath.backup") { Remove-Item "$toolPath.backup" -Force }
-            Write-Log "Azure Sign Tool downloaded successfully" -Console
+            Write-Log "Azure Sign Tool v6.0.1 downloaded successfully" -Console
             return $toolPath
         }
         catch {
