@@ -101,3 +101,9 @@ The tool supports signing the following file types:
 ## Log Files
 
 Logs are saved in the `logs` subdirectory with timestamps for each signing operation.
+
+## Author Information
+
+Developed by Matt Mueller (matthew.mueller@teledyne.com) for Teledyne Technologies Incorporated.
+
+© 2024 Teledyne Technologies Incorporated. All rights reserved.
