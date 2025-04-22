@@ -2,56 +2,78 @@
 .SYNOPSIS
     Wrapper script for code signing using Azure Key Vault certificates
 .DESCRIPTION
-    Provides a streamlined interface for code signing PowerShell scripts and executables
-    using certificates stored in Azure Key Vault. Supports storing certificate names
-    for quick access and handles all aspects of the signing process.
+    Provides a streamlined interface for code signing PowerShell scripts, executables,
+    and containers using certificates stored in Azure Key Vault. Supports storing 
+    certificate names for quick access and handles all aspects of the signing process.
 .NOTES
     Created: February 11, 2024
+    Updated: April 22, 2025
     Author: Matt Mueller (matthew.mueller@teledyne.com)
+    Company: Teledyne Technologies Incorporated
+.LINK
+    https://github.com/TeledyneDevOps/CodeSigning
 #>
 
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
+    # Path to file or directory to be signed
     [Parameter(Mandatory=$false, Position=0)]
     [string]$Path,
     
+    # File patterns to include for signing
     [Parameter(Mandatory=$false)]
     [string[]]$Include = @("*.ps1", "*.psm1", "*.psd1", "*.dll", "*.exe", "*.zip", "*.msi", "*.msix", 
-                         "*.appx", "*.cab", "*.sys", "*.vbs", "*.js", "*.wsf", "*.cat", "*.msp", "*.jar"),
+                         "*.appx", "*.cab", "*.sys", "*.vbs", "*.js", "*.wsf", "*.cat", "*.msp", "*.jar",
+                         "*.container", "*.tar", "*.oci"),
     
+    # File patterns to exclude from signing
     [Parameter(Mandatory=$false)]
     [string[]]$Exclude = @(),
     
+    # Path to configuration file
     [Parameter(Mandatory=$false)]
     [string]$ConfigPath = "$PSScriptRoot\config.json",
     
+    # Directory for storing log files
     [Parameter(Mandatory=$false)]
     [string]$LogDir = "$PSScriptRoot\logs",
     
+    # Name of certificate to use for signing
     [Parameter(Mandatory=$false)]
     [string]$CertificateName,
     
+    # Process directories recursively
     [Parameter(Mandatory=$false)]
     [switch]$Recurse,
     
+    # Force signing of already signed files
     [Parameter(Mandatory=$false)]
     [switch]$Force,
     
+    # SIEM server address for logging
     [Parameter(Mandatory=$false)]
     [string]$SIEMServer = "us1-nslb-ecs.tdy.teledyne.com",
     
+    # SIEM server port for logging
     [Parameter(Mandatory=$false)]
     [int]$SIEMPort = 11818,
     
+    # Protocol to use for SIEM logging
     [Parameter(Mandatory=$false)]
     [ValidateSet("TCP", "UDP")]
     [string]$SIEMProtocol = "TCP",
     
+    # Enable/disable SIEM logging
     [Parameter(Mandatory=$false)]
     [bool]$EnableSIEM = $true,
     
+    # Remember the selected certificate for future use
     [Parameter(Mandatory=$false)]
-    [switch]$RememberCertificate
+    [switch]$RememberCertificate,
+    
+    # Use Cosign for container signing instead of AzureSignTool
+    [Parameter(Mandatory=$false)]
+    [switch]$UseContainerSigning
 )
 
 Begin {
@@ -259,10 +281,12 @@ Begin {
             Downloads or returns path to AzureSignTool executable
         .DESCRIPTION
             Manages the AzureSignTool executable, downloading it if not present
-            or returning the path if it exists. Handles architecture detection
-            and backup/restore during updates.
+            or returning the path if it exists. Handles backup/restore during updates.
         .OUTPUTS
             String containing the path to AzureSignTool-x64.exe
+        .NOTES
+            The tool is downloaded from GitHub if not present or if Force is specified.
+            A backup is created during updates to ensure recoverability.
         #>
         $toolPath = "$PSScriptRoot\AzureSignTool-x64.exe"
         if ((Test-Path $toolPath) -and (-not $Force)) { return $toolPath }
@@ -290,6 +314,46 @@ Begin {
         }
     }
 
+    function Get-Cosign {
+        <#
+        .SYNOPSIS
+            Downloads or returns path to Cosign executable
+        .DESCRIPTION
+            Manages the Cosign executable, downloading it if not present
+            or returning the path if it exists. Used for container signing.
+        .OUTPUTS
+            String containing the path to cosign.exe
+        .NOTES
+            The tool is downloaded from GitHub if not present or if Force is specified.
+            A backup is created during updates to ensure recoverability.
+            Cosign v2.2.3 is used for container signing with Azure Key Vault integration.
+        #>
+        $toolPath = "$PSScriptRoot\cosign.exe"
+        if ((Test-Path $toolPath) -and (-not $Force)) { return $toolPath }
+        
+        try {
+            Write-Log "Downloading Cosign tool for container signing..." -Console
+            # Download latest version of Cosign
+            $url = "https://github.com/sigstore/cosign/releases/download/v2.2.3/cosign-windows-amd64.exe"
+            
+            if (Test-Path $toolPath) { Copy-Item $toolPath "$toolPath.backup" -Force }
+            
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $url -OutFile $toolPath
+            if (Test-Path "$toolPath.backup") { Remove-Item "$toolPath.backup" -Force }
+            Write-Log "Cosign v2.2.3 downloaded successfully" -Console
+            return $toolPath
+        }
+        catch {
+            Write-Log $_.Exception.Message -Level ERROR -Console
+            if (Test-Path "$toolPath.backup") { 
+                Move-Item "$toolPath.backup" $toolPath -Force
+                Write-Log "Restored previous version" -Level WARN
+            }
+            throw
+        }
+    }
+
     function Test-FileSignable {
         <#
         .SYNOPSIS
@@ -300,10 +364,14 @@ Begin {
             - Matches include patterns
             - Doesn't match exclude patterns
             - Is a supported file type for signing
+            - Not already signed (unless Force is specified)
         .PARAMETER FilePath
             The path to the file to test
         .OUTPUTS
             Boolean indicating if the file should be signed
+        .NOTES
+            Special handling is included for container files and archives.
+            Already signed files are skipped unless Force is specified.
         #>
         param([string]$FilePath)
         
@@ -329,8 +397,15 @@ Begin {
                 if ($fileName -like $pattern) { return $false }
             }
             
-            # Handle special case for .zip and archive files - they must be PE files or valid scripts
+            # Handle special case for container images and OCI artifacts
             $extension = [System.IO.Path]::GetExtension($fileName).ToLower()
+            if ($extension -in @('.container', '.tar', '.oci') -or $UseContainerSigning) {
+                # Container files or references need special handling with Cosign
+                Write-Log "Detected container artifact for Cosign signing" -Level INFO -Console
+                return $true
+            }
+            
+            # Handle special case for .zip and archive files - they must be PE files or valid scripts
             if ($extension -in @('.zip', '.msix', '.appx', '.cab', '.jar')) {
                 # We can't sign regular ZIP files directly, but can sign some container formats
                 if ($extension -eq '.zip') {
@@ -597,6 +672,12 @@ Begin {
 
     $azureSignToolPath = Get-AzureSignTool
 
+    # Get Cosign if needed for container signing
+    if ($UseContainerSigning) {
+        $cosignPath = Get-Cosign
+        Write-Log "Container signing enabled, using Cosign from: $cosignPath" -Console
+    }
+
     # Modified certificate selection with management options
     if (-not $CertificateName) {
         $CertificateName = if ($env:AZURE_CERT_NAME) {
@@ -765,6 +846,85 @@ Process {
                 # Determine if special parameters are needed for this file type
                 $additionalParams = @()
                 
+                # Handle container signing with Cosign
+                if ($extension -in @('.container', '.tar', '.oci') -or $UseContainerSigning) {
+                    # Download Cosign if not already available
+                    if (-not $cosignPath) {
+                        $cosignPath = Get-Cosign
+                    }
+                    
+                    # Get container reference - either direct path or content of reference file
+                    $containerRef = $file.FullName
+                    if ($file.Extension -in @('.container', '.txt')) {
+                        # If the file is a reference file, read the reference from its content
+                        $containerRef = Get-Content $file.FullName -Raw
+                    }
+                    
+                    Write-Log "Signing container: $containerRef with Cosign" -Console
+                    
+                    if ($PSCmdlet.ShouldProcess($file.FullName, "Sign Container")) {
+                        # Set up environment variables required by Cosign for Azure Key Vault access
+                        $env:COSIGN_AZUREKMS_RESOURCEID = $config.KeyVaultUrl
+                        $env:COSIGN_AZUREKMS_CLIENTID = $config.ClientId
+                        $env:COSIGN_AZUREKMS_TENANT = $config.TenantId
+                        
+                        try {
+                            # Prepare Cosign command-line arguments
+                            $signArgs = @(
+                                "sign",  # Command to sign a container
+                                "--key", "azurekms://$($config.KeyVaultUrl)/$CertificateName",  # Azure Key Vault key reference
+                                "$containerRef"  # Container reference to sign
+                            )
+                            
+                            # Execute Cosign and capture any errors
+                            $process = Start-Process -FilePath $cosignPath -ArgumentList $signArgs -NoNewWindow -Wait -PassThru -RedirectStandardError "$LogDir\stderr.txt"
+                            
+                            # Check for errors
+                            if ($process.ExitCode -ne 0) { 
+                                $errorDetail = Get-Content "$LogDir\stderr.txt" -ErrorAction SilentlyContinue
+                                throw "Container signing failed with exit code $($process.ExitCode). Details: $errorDetail"
+                            }
+                            
+                            # Log successful signing
+                            $successMessage = "Successfully signed container '$containerRef' using Cosign with certificate '$CertificateName'"
+                            Write-Log $successMessage -Level SUCCESS -Console
+                            
+                            # Track signing details for reporting
+                            $signingDetails = @{
+                                "EventType" = "ContainerSigning"
+                                "Action" = "Signed"
+                                "FilePath" = $file.FullName
+                                "FileName" = $file.Name
+                                "ContainerRef" = $containerRef
+                                "FileSize" = $file.Length
+                                "FileType" = "container"
+                                "CertificateName" = $CertificateName
+                                "SignatureMethod" = "Cosign"
+                                "KeyVaultUrl" = $config.KeyVaultUrl
+                                "SignedBy" = $env:USERNAME
+                                "SignedOn" = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                                "SignedOnComputer" = $env:COMPUTERNAME
+                            }
+                            
+                            $signedFilesDetails += $signingDetails
+                            $stats.Success++
+                            
+                            # Clean up environment variables for security
+                            $env:COSIGN_AZUREKMS_RESOURCEID = $null
+                            $env:COSIGN_AZUREKMS_CLIENTID = $null
+                            $env:COSIGN_AZUREKMS_TENANT = $null
+                        }
+                        catch {
+                            throw "Cosign signing failed: $_"
+                        }
+                    } else {
+                        $stats.Skipped++
+                    }
+                    
+                    # Skip the standard signing process for container files
+                    continue
+                }
+
                 # Specific file type handling
                 switch ($extension) {
                     '.zip' {
