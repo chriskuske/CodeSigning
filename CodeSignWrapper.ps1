@@ -901,20 +901,31 @@ Process {
                         $env:COSIGN_AZUREKMS_TENANT = $config.TenantId
                         
                         try {
-                            # Prepare Cosign command-line arguments
+                            # Prepare Cosign command-line arguments - ensure proper quoting
                             $signArgs = @(
-                                "sign",  # Command to sign a container
-                                "--key", "azurekms://$($config.KeyVaultUrl)/$CertificateName",  # Azure Key Vault key reference
-                                "$containerRef"  # Container reference to sign
+                                "sign",
+                                "--key", "azurekms://$($config.KeyVaultUrl)/$CertificateName",
+                                "`"$containerRef`""  # Ensure path is quoted to handle spaces
                             )
                             
-                            # Execute Cosign and capture any errors
-                            $process = Start-Process -FilePath $cosignPath -ArgumentList $signArgs -NoNewWindow -Wait -PassThru -RedirectStandardError "$LogDir\stderr.txt"
+                            # Execute Cosign with properly quoted arguments
+                            $processStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+                            $processStartInfo.FileName = $cosignPath
+                            $processStartInfo.Arguments = $signArgs -join ' '
+                            $processStartInfo.RedirectStandardError = $true
+                            $processStartInfo.UseShellExecute = $false
+                            $processStartInfo.CreateNoWindow = $true
+                            
+                            $process = New-Object System.Diagnostics.Process
+                            $process.StartInfo = $processStartInfo
+                            [void]$process.Start()
+                            $stderr = $process.StandardError.ReadToEnd()
+                            $process.WaitForExit()
                             
                             # Check for errors
                             if ($process.ExitCode -ne 0) { 
-                                $errorDetail = Get-Content "$LogDir\stderr.txt" -ErrorAction SilentlyContinue
-                                throw "Container signing failed with exit code $($process.ExitCode). Details: $errorDetail"
+                                $stderr | Out-File "$LogDir\stderr.txt"
+                                throw "Container signing failed with exit code $($process.ExitCode). Details: $stderr"
                             }
                             
                             # Log successful signing
@@ -995,14 +1006,24 @@ Process {
                 # Add any file-specific parameters
                 $signArgs += $additionalParams
                 
-                # Add the filename
-                $signArgs += $file.FullName
-                
                 if ($PSCmdlet.ShouldProcess($file.FullName, "Sign")) {
-                    $process = Start-Process -FilePath $azureSignToolPath -ArgumentList $signArgs -NoNewWindow -Wait -PassThru -RedirectStandardError "$LogDir\stderr.txt"
+                    # Create a properly quoted command line to handle spaces in paths
+                    $processStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+                    $processStartInfo.FileName = $azureSignToolPath
+                    $processStartInfo.Arguments = "$($signArgs -join ' ') `"$($file.FullName)`""
+                    $processStartInfo.RedirectStandardError = $true
+                    $processStartInfo.UseShellExecute = $false
+                    $processStartInfo.CreateNoWindow = $true
+                    
+                    $process = New-Object System.Diagnostics.Process
+                    $process.StartInfo = $processStartInfo
+                    [void]$process.Start()
+                    $stderr = $process.StandardError.ReadToEnd()
+                    $process.WaitForExit()
+                    
                     if ($process.ExitCode -ne 0) { 
-                        $errorDetail = Get-Content "$LogDir\stderr.txt" -ErrorAction SilentlyContinue
-                        throw "Signing failed with exit code $($process.ExitCode). Details: $errorDetail"
+                        $stderr | Out-File "$LogDir\stderr.txt"
+                        throw "Signing failed with exit code $($process.ExitCode). Details: $stderr"
                     }
                     
                     # Enhanced signature verification with structured SIEM logging

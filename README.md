@@ -104,88 +104,31 @@ You can also create a text file with the container reference and sign that:
 | AzureSignTool not found | The tool will automatically download v6.0.1 x64 version, but may fail if internet access is restricted |
 | Container signing fails | Ensure the container exists and you have proper permissions to access the registry |
 | Cosign errors | Check if the key in Azure KeyVault is compatible with Cosign (ECDSA P-256) |
+| Path errors with spaces | Paths with spaces are now properly handled. If you see "File not found" errors where the path is split at spaces, make sure you're using the latest version of the script |
 
-## Security Considerations
+### Handling Paths with Spaces
 
-- Key Vault secrets are never saved to disk
-- Certificate operations are logged to SIEM (if enabled)
-- All credential storage is handled securely through Windows Credential Manager
-- Temporary secrets are zeroed out from memory after use
-- All commands are logged with detailed attribution
+The CodeSignWrapper now properly handles paths with spaces in the filenames or directories. If you encounter any errors related to paths being split at spaces (like "File 'C:\Path\To\My' does not exist. File 'File.dll' does not exist"), please update to the latest version which addresses this issue.
 
-## Example Workflow
+For CI/CD systems like Bamboo, Jenkins, or Azure DevOps:
+- No special escaping is needed for paths with spaces
+- Paths are automatically quoted correctly when passed to signing tools
+- Both relative and absolute paths are supported
 
-1. Run the script without parameters: `.\CodeSignWrapper.ps1`
-2. Select your certificate from the menu or enter a new one
-3. Enter the Key Vault secret when prompted
-4. Enter the path to the file or directory to sign
-5. The tool will process and sign all eligible files
+## Release Notes
 
-## Container Signing
+### v1.2.0 (April 25, 2025)
+- Fixed handling of paths containing spaces
+- Enhanced error reporting with specific messages
+- Improved JSON configuration validation with better error messages
+- Fixed container signing with quoted paths
 
-The tool integrates with Cosign for container signing. It uses the same Azure Key Vault certificates that are used for code signing, providing a consistent security model.
+### v1.1.0 (April 22, 2025)
+- Added support for container signing with Cosign
+- Enhanced SIEM logging format
+- Added certificate management interface
+- Added remembered certificate functionality
 
-### Container Signing Requirements
-
-- Container must exist in a registry accessible to the signing machine
-- The Azure Key Vault key must be compatible with Cosign's ECDSA requirements
-- Container images should be specified either:
-  - Directly as a parameter with -UseContainerSigning
-  - In a file with .container extension containing the image reference
-  - As an OCI artifact (.oci file)
-  - As a TAR archive (.tar file)
-
-### Verifying Container Signatures
-
-To verify a signed container:
-
-```powershell
-cosign verify --key azurekms://[keyvault-url]/[key-name] [container-reference]
-```
-
-## Log Files
-
-Logs are saved in the `logs` subdirectory with timestamps for each signing operation. These logs contain detailed information about each signing operation including:
-
-- Files processed
-- Signing status (success/failure)
-- Certificate details
-- Timestamps
-- Error messages (if applicable)
-
-## Author Information
-
-Developed by Matt Mueller (matthew.mueller@teledyne.com) for Teledyne Technologies Incorporated.
-
-Updated: April 22, 2025
-
-© 2025 Teledyne Technologies Incorporated. All rights reserved.
-
-## Configuration
-
-The tool uses a configuration file (`config.json`) with the following settings:
-
-| Setting | Description |
-|---------|-------------|
-| KeyVaultUrl | URL of the Azure Key Vault containing certificates |
-| ClientId | Azure Client ID for authentication |
-| TimestampServer | Server used for timestamp validation |
-| DefaultCertificateName | Default certificate name to use when none specified |
-| TenantId | Azure Tenant ID for authentication |
-
-> **Important:** The config.json file must be valid JSON with:
-> - No comments (JSON doesn't support `//` or `/* */` style comments)
-> - No trailing commas after the last item in objects or arrays
-> - All property names in double quotes (`"PropertyName"`)
-> - Valid property values (strings in quotes, numbers without quotes)
-
-Example of a properly formatted config.json file:
-```json
-{
-  "KeyVaultUrl": "https://your-keyvault.vault.azure.net/",
-  "ClientId": "your-client-id",
-  "TimestampServer": "http://timestamp.digicert.com",
-  "DefaultCertificateName": "Your-Certificate-Name",
-  "TenantId": "your-tenant-id"
-}
-```
+### v1.0.0 (February 11, 2024)
+- Initial release with support for code signing using Azure Key Vault certificates
+- Support for multiple file types and recursive directory signing
