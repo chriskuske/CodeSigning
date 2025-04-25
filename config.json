@@ -1,5 +1,3 @@
-// Configuration file for CodeSignWrapper.ps1
-// Last Updated: April 22, 2025
 {
   "KeyVaultUrl": "https://itss-managed-certs.vault.azure.net/",
   "ClientId": "c699b1cf-73bd-4896-8dd2-74ea7d99dc60",

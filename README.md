@@ -160,3 +160,32 @@ Developed by Matt Mueller (matthew.mueller@teledyne.com) for Teledyne Technologi
 Updated: April 22, 2025
 
 © 2025 Teledyne Technologies Incorporated. All rights reserved.
+
+## Configuration
+
+The tool uses a configuration file (`config.json`) with the following settings:
+
+| Setting | Description |
+|---------|-------------|
+| KeyVaultUrl | URL of the Azure Key Vault containing certificates |
+| ClientId | Azure Client ID for authentication |
+| TimestampServer | Server used for timestamp validation |
+| DefaultCertificateName | Default certificate name to use when none specified |
+| TenantId | Azure Tenant ID for authentication |
+
+> **Important:** The config.json file must be valid JSON with:
+> - No comments (JSON doesn't support `//` or `/* */` style comments)
+> - No trailing commas after the last item in objects or arrays
+> - All property names in double quotes (`"PropertyName"`)
+> - Valid property values (strings in quotes, numbers without quotes)
+
+Example of a properly formatted config.json file:
+```json
+{
+  "KeyVaultUrl": "https://your-keyvault.vault.azure.net/",
+  "ClientId": "your-client-id",
+  "TimestampServer": "http://timestamp.digicert.com",
+  "DefaultCertificateName": "Your-Certificate-Name",
+  "TenantId": "your-tenant-id"
+}
+```
