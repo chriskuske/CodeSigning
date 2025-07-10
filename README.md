@@ -12,6 +12,22 @@ A PowerShell-based tool for signing code artifacts and container images using ce
    ```
 4. Follow prompts for certificate and secret if needed.
 
+## One-Click Installer & Context Menu (No Admin Required)
+
+To install CodeSignWrapper and add the right-click context menu for files and folders:
+
+1. Run `Install-CodeSignWrapper.ps1` as your user (no admin needed).
+2. All files will be copied to `%LOCALAPPDATA%\CodeSignWrapper`.
+3. The context menu "Sign with Azure Key Vault" will be available for files and folders.
+4. You may need to restart Explorer or log off/on for the menu to appear.
+5. To uninstall, remove `%LOCALAPPDATA%\CodeSignWrapper` and delete the related registry keys under `HKEY_CURRENT_USER\Software\Classes\*\shell\CodeSignWithAzure` and `HKEY_CURRENT_USER\Software\Classes\Directory\shell\CodeSignWithAzure`.
+
+## Simple GUI
+
+A basic GUI is available for users who prefer not to use the command line:
+
+- Run `CodeSignGui.ps1` to open a window where you can browse for a file and sign it with one click.
+
 ## Overview
 
 This tool provides a streamlined interface for code signing PowerShell scripts, executables, and various other file types using certificates stored in Azure Key Vault. It also supports signing Docker/container images using Cosign. It handles certificate management, signatures, verification, and SIEM logging in one comprehensive solution.
@@ -28,6 +44,8 @@ This tool provides a streamlined interface for code signing PowerShell scripts, 
 - Sign Docker/container images with Cosign and Azure Key Vault
 - Enhanced error handling and validation
 - Handles paths with spaces robustly
+- **Right-click context menu integration (no admin required)**
+- **Simple GUI for file selection and signing**
 
 ## Requirements
 
@@ -98,6 +116,22 @@ You can also create a text file with the container reference and sign that:
 ```powershell
 .\CodeSignWrapper.ps1 -Path "C:\Path\To\containerref.container"
 ```
+
+### Using the GUI
+
+```powershell
+.\CodeSignGui.ps1
+```
+- Select a file and click "Sign".
+
+### Using the Context Menu
+
+- After running `Install-CodeSignWrapper.ps1`, right-click any file or folder and choose **"Sign with Azure Key Vault"**.
+
+### Installing/Uninstalling the Context Menu
+
+- **Install:** Run `Install-CodeSignWrapper.ps1` (no admin required).
+- **Uninstall:** Delete `%LOCALAPPDATA%\CodeSignWrapper` and remove the registry keys as described above.
 
 ## Certificate Management
 
@@ -171,12 +205,23 @@ A: Cosign requires ECDSA P-256 keys in Azure Key Vault for container signing.
 **Q: How do I back up my stored credentials?**  
 A: Credentials are stored in Windows Credential Manager. Use Windows tools to export/import if needed.
 
+**Q: How do I get the right-click menu?**  
+A: Run `Install-CodeSignWrapper.ps1` as your user. No admin rights are required.
+
+**Q: How do I use the GUI?**  
+A: Run `CodeSignGui.ps1` and use the window to select and sign a file.
+
 ## Contributors
 
 - Matt Mueller (matthew.mueller@teledyne.com)
 - Ankit Chahar (ankit.chahar@teledyne.com)
 
 ## Release Notes
+
+### v1.4.0 (May 27, 2025)
+- Added installer script for right-click context menu (no admin required)
+- Added simple GUI for file selection and signing
+- Documentation updates for new install and GUI features
 
 ### v1.3.0 (May 27, 2025)
 - Improved error handling and certificate validation
