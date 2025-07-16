@@ -218,7 +218,7 @@ A: Run `CodeSignGui.ps1` and use the window to select and sign a file.
 
 ## Release Notes
 
-### v1.4.0 (May 27, 2025)
+### v1.4.0 (Jul 8, 2025)
 - Added installer script for right-click context menu (no admin required)
 - Added simple GUI for file selection and signing
 - Documentation updates for new install and GUI features
