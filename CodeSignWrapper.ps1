@@ -50,7 +50,11 @@ param(
     # Force signing of already signed files
     [Parameter(Mandatory=$false)]
     [switch]$Force,
-    
+
+    # New: Force re-download of signing tools (AzureSignTool / Cosign)
+    [Parameter(Mandatory=$false)]
+    [switch]$UpdateTools,
+
     # SIEM server address for logging
     [Parameter(Mandatory=$false)]
     [string]$SIEMServer = "us1-nslb-ecs.tdy.teledyne.com",
@@ -252,6 +256,7 @@ Options:
   -RememberCertificate        Remember last used certificate
   -Recurse                   Process directories recursively
   -Force                     Force re-signing of already signed files
+  -UpdateTools               Force re-download of AzureSignTool/Cosign
   -UseContainerSigning       Use Cosign for container signing
   -Help                      Show this help message
   -Version                   Show script and tool versions
@@ -263,7 +268,7 @@ See README.md for full documentation.
     }
 
     if ($Version) {
-        Write-Host "CodeSignWrapper.ps1 version 1.3.0"
+        Write-Host "CodeSignWrapper.ps1 version 1.4.0"
         Write-Host "AzureSignTool: v6.0.1"
         Write-Host "Cosign: v2.2.3"
         exit 0
@@ -414,21 +419,720 @@ See README.md for full documentation.
         }
     }
 
-    # Check for required files
-    $requiredFiles = @(
-        @{Name = "CredentialManager.ps1"; Path = $credentialManagerPath},
-        @{Name = "AzureSignTool-x64.exe"; Path = (Join-Path $scriptDir "AzureSignTool-x64.exe")}
-    )
+    if ($Help) {
+        Write-Host @"
+CodeSignWrapper.ps1 - Sign files and containers using Azure Key Vault certificates
 
-    foreach ($file in $requiredFiles) {
-        if (-not (Test-Path $file.Path)) {
-            if ($file.Name -eq "CredentialManager.ps1") {
-                Write-Host "Required file 'CredentialManager.ps1' not found in script directory." -ForegroundColor Red
-                Write-Host "Download it from: https://github.com/TeledyneDevOps/CodeSigning" -ForegroundColor Yellow
-                exit 1
+Usage:
+  .\CodeSignWrapper.ps1 -Path <file|directory> [options]
+
+Options:
+  -Include <patterns>         File patterns to include (default: *.ps1, *.exe, etc)
+  -Exclude <patterns>         File patterns to exclude
+  -CertificateName <name>     Use specific certificate
+  -RememberCertificate        Remember last used certificate
+  -Recurse                   Process directories recursively
+  -Force                     Force re-signing of already signed files
+  -UpdateTools               Force re-download of AzureSignTool/Cosign
+  -UseContainerSigning       Use Cosign for container signing
+  -Help                      Show this help message
+  -Version                   Show script and tool versions
+  -DryRun                    Show what would be signed, but do not sign
+
+See README.md for full documentation.
+"@
+        exit 0
+    }
+
+    if ($Version) {
+        Write-Host "CodeSignWrapper.ps1 version 1.4.0"
+        Write-Host "AzureSignTool: v6.0.1"
+        Write-Host "Cosign: v2.2.3"
+        exit 0
+    }
+
+    # Ensure script can find its dependencies regardless of where it's run from
+    $scriptPath = $MyInvocation.MyCommand.Path
+    $scriptDir = Split-Path -Parent $scriptPath
+    
+    # Update paths to be relative to script location
+    $ConfigPath = Join-Path $scriptDir "config.json"
+    $LogDir = Join-Path $scriptDir "logs"
+    $credentialManagerPath = Join-Path $scriptDir "CredentialManager.ps1"
+    $lastUsedCertPath = Join-Path $scriptDir "lastcert.txt"
+    
+    # Create directories if they don't exist
+    if (-not (Test-Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+    }
+
+    # Initialize log file with timestamp
+    $LogFile = Join-Path $LogDir ("signing_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+
+    # Enhanced SIEM logging for better visibility
+    function Send-ToSIEM {
+        param(
+            [string]$Message,
+            [string]$Level = "INFO",
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$ForceSend = $false
+        )
+        
+        # Only send to SIEM if explicitly forced or if EnableSIEM is true
+        # This allows us to collect logs but only send the final summary
+        if ((-not $EnableSIEM) -and (-not $ForceSend)) { return }
+        
+        try {
+            # Create a structured log event with Exabeam expected fields
+            $eventProperties = @{
+                # Standard Exabeam fields based on your screenshot
+                "activity" = $EventType
+                "activity_type" = "code-signing"  
+                "landscape" = "endpoint security"
+                # Improved mapping of log levels to outcomes
+                "outcome" = switch ($Level) {
+                    "SUCCESS" { "success" }
+                    "ERROR" { "failure" }
+                    "WARN" { "warning" }
+                    "INFO" { "informational" }
+                    default { "informational" }
+                }
+                "platform" = "Windows"
+                "product" = "CodeSignWrapper"
+                "product_category" = "security operation"
+                "subject" = $Action
+                "time" = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                "vendor" = "Teledyne"
+                "src_ip" = [string](Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne "127.0.0.1" } | Select-Object -First 1 -ExpandProperty IPAddress)
+                "user" = $env:USERNAME
+                "host" = $env:COMPUTERNAME
+                "Message" = $Message
             }
-            throw "Required file '$($file.Name)' not found in script directory. Please ensure all components are extracted together."
+            
+            # Add any additional properties 
+            foreach ($key in $Properties.Keys) {
+                $eventProperties[$key] = $Properties[$key]
+            }
+            
+            # Convert to JSON for better parsing in SIEM
+            $jsonEvent = $eventProperties | ConvertTo-Json -Compress
+            
+            if ($SIEMProtocol -eq "TCP") {
+                $client = New-Object System.Net.Sockets.TcpClient
+                $client.Connect($SIEMServer, $SIEMPort)
+                $stream = $client.GetStream()
+                $writer = New-Object System.IO.StreamWriter($stream)
+                $writer.WriteLine($jsonEvent)
+                $writer.Flush()
+                $writer.Close()
+                $stream.Close()
+                $client.Close()
+            }
+            else { # UDP
+                $endpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($SIEMServer), $SIEMPort)
+                $udpClient = New-Object System.Net.Sockets.UdpClient
+                $bytes = [System.Text.Encoding]::ASCII.GetBytes($jsonEvent)
+                $udpClient.Send($bytes, $bytes.Length, $endpoint)
+                $udpClient.Close()
+            }
         }
+        catch {
+            # Log error locally but don't fail the main operation
+            $errorMessage = "Failed to send to SIEM: $_"
+            Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] $errorMessage"
+            Write-Host $errorMessage -ForegroundColor Red
+        }
+    }
+    
+    function Write-Log {
+        <#
+        .SYNOPSIS
+            Writes formatted log messages to both file and console, and SIEM if enabled
+        .DESCRIPTION
+            Handles logging of messages with timestamps and different severity levels,
+            writing to a log file, optionally to the console with color coding,
+            and to SIEM if enabled.
+        .PARAMETER Message
+            The message to log
+        .PARAMETER Level
+            The severity level (INFO, WARN, ERROR, SUCCESS)
+        .PARAMETER Console
+            Switch to indicate if message should also be written to console
+        .PARAMETER Properties
+            Additional properties to include in SIEM logs as a hashtable
+        #>
+        param(
+            [string]$Message,
+            [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS')]
+            [string]$Level = "INFO",
+            [switch]$Console,
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$SendToSIEM = $false
+        )
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $logMessage = "$timestamp [$Level] $Message"
+        
+        # Write to log file
+        Add-Content -Path $LogFile -Value $logMessage
+        
+        # Write to console if requested or for important messages
+        if ($Console -or $Level -in @('ERROR', 'SUCCESS') -or $VerbosePreference -eq 'Continue') {
+            $color = switch ($Level) {
+                'ERROR' { 'Red' }
+                'WARN'  { 'Yellow' }
+                'SUCCESS' { 'Green' }
+                default { 'Gray' }
+            }
+            Write-Host $logMessage -ForegroundColor $color
+        }
+        
+        # Only send to SIEM if explicitly requested now - we'll do a comprehensive send at the end
+        if ($SendToSIEM) {
+            Send-ToSIEM -Message $Message -Level $Level -EventType $EventType -Action $Action -Properties $Properties
+        }
+    }
+
+    if ($Help) {
+        Write-Host @"
+CodeSignWrapper.ps1 - Sign files and containers using Azure Key Vault certificates
+
+Usage:
+  .\CodeSignWrapper.ps1 -Path <file|directory> [options]
+
+Options:
+  -Include <patterns>         File patterns to include (default: *.ps1, *.exe, etc)
+  -Exclude <patterns>         File patterns to exclude
+  -CertificateName <name>     Use specific certificate
+  -RememberCertificate        Remember last used certificate
+  -Recurse                   Process directories recursively
+  -Force                     Force re-signing of already signed files
+  -UpdateTools               Force re-download of AzureSignTool/Cosign
+  -UseContainerSigning       Use Cosign for container signing
+  -Help                      Show this help message
+  -Version                   Show script and tool versions
+  -DryRun                    Show what would be signed, but do not sign
+
+See README.md for full documentation.
+"@
+        exit 0
+    }
+
+    if ($Version) {
+        Write-Host "CodeSignWrapper.ps1 version 1.4.0"
+        Write-Host "AzureSignTool: v6.0.1"
+        Write-Host "Cosign: v2.2.3"
+        exit 0
+    }
+
+    # Ensure script can find its dependencies regardless of where it's run from
+    $scriptPath = $MyInvocation.MyCommand.Path
+    $scriptDir = Split-Path -Parent $scriptPath
+    
+    # Update paths to be relative to script location
+    $ConfigPath = Join-Path $scriptDir "config.json"
+    $LogDir = Join-Path $scriptDir "logs"
+    $credentialManagerPath = Join-Path $scriptDir "CredentialManager.ps1"
+    $lastUsedCertPath = Join-Path $scriptDir "lastcert.txt"
+    
+    # Create directories if they don't exist
+    if (-not (Test-Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+    }
+
+    # Initialize log file with timestamp
+    $LogFile = Join-Path $LogDir ("signing_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+
+    # Enhanced SIEM logging for better visibility
+    function Send-ToSIEM {
+        param(
+            [string]$Message,
+            [string]$Level = "INFO",
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$ForceSend = $false
+        )
+        
+        # Only send to SIEM if explicitly forced or if EnableSIEM is true
+        # This allows us to collect logs but only send the final summary
+        if ((-not $EnableSIEM) -and (-not $ForceSend)) { return }
+        
+        try {
+            # Create a structured log event with Exabeam expected fields
+            $eventProperties = @{
+                # Standard Exabeam fields based on your screenshot
+                "activity" = $EventType
+                "activity_type" = "code-signing"  
+                "landscape" = "endpoint security"
+                # Improved mapping of log levels to outcomes
+                "outcome" = switch ($Level) {
+                    "SUCCESS" { "success" }
+                    "ERROR" { "failure" }
+                    "WARN" { "warning" }
+                    "INFO" { "informational" }
+                    default { "informational" }
+                }
+                "platform" = "Windows"
+                "product" = "CodeSignWrapper"
+                "product_category" = "security operation"
+                "subject" = $Action
+                "time" = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                "vendor" = "Teledyne"
+                "src_ip" = [string](Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne "127.0.0.1" } | Select-Object -First 1 -ExpandProperty IPAddress)
+                "user" = $env:USERNAME
+                "host" = $env:COMPUTERNAME
+                "Message" = $Message
+            }
+            
+            # Add any additional properties 
+            foreach ($key in $Properties.Keys) {
+                $eventProperties[$key] = $Properties[$key]
+            }
+            
+            # Convert to JSON for better parsing in SIEM
+            $jsonEvent = $eventProperties | ConvertTo-Json -Compress
+            
+            if ($SIEMProtocol -eq "TCP") {
+                $client = New-Object System.Net.Sockets.TcpClient
+                $client.Connect($SIEMServer, $SIEMPort)
+                $stream = $client.GetStream()
+                $writer = New-Object System.IO.StreamWriter($stream)
+                $writer.WriteLine($jsonEvent)
+                $writer.Flush()
+                $writer.Close()
+                $stream.Close()
+                $client.Close()
+            }
+            else { # UDP
+                $endpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($SIEMServer), $SIEMPort)
+                $udpClient = New-Object System.Net.Sockets.UdpClient
+                $bytes = [System.Text.Encoding]::ASCII.GetBytes($jsonEvent)
+                $udpClient.Send($bytes, $bytes.Length, $endpoint)
+                $udpClient.Close()
+            }
+        }
+        catch {
+            # Log error locally but don't fail the main operation
+            $errorMessage = "Failed to send to SIEM: $_"
+            Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] $errorMessage"
+            Write-Host $errorMessage -ForegroundColor Red
+        }
+    }
+    
+    function Write-Log {
+        <#
+        .SYNOPSIS
+            Writes formatted log messages to both file and console, and SIEM if enabled
+        .DESCRIPTION
+            Handles logging of messages with timestamps and different severity levels,
+            writing to a log file, optionally to the console with color coding,
+            and to SIEM if enabled.
+        .PARAMETER Message
+            The message to log
+        .PARAMETER Level
+            The severity level (INFO, WARN, ERROR, SUCCESS)
+        .PARAMETER Console
+            Switch to indicate if message should also be written to console
+        .PARAMETER Properties
+            Additional properties to include in SIEM logs as a hashtable
+        #>
+        param(
+            [string]$Message,
+            [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS')]
+            [string]$Level = "INFO",
+            [switch]$Console,
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$SendToSIEM = $false
+        )
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $logMessage = "$timestamp [$Level] $Message"
+        
+        # Write to log file
+        Add-Content -Path $LogFile -Value $logMessage
+        
+        # Write to console if requested or for important messages
+        if ($Console -or $Level -in @('ERROR', 'SUCCESS') -or $VerbosePreference -eq 'Continue') {
+            $color = switch ($Level) {
+                'ERROR' { 'Red' }
+                'WARN'  { 'Yellow' }
+                'SUCCESS' { 'Green' }
+                default { 'Gray' }
+            }
+            Write-Host $logMessage -ForegroundColor $color
+        }
+        
+        # Only send to SIEM if explicitly requested now - we'll do a comprehensive send at the end
+        if ($SendToSIEM) {
+            Send-ToSIEM -Message $Message -Level $Level -EventType $EventType -Action $Action -Properties $Properties
+        }
+    }
+
+    if ($Help) {
+        Write-Host @"
+CodeSignWrapper.ps1 - Sign files and containers using Azure Key Vault certificates
+
+Usage:
+  .\CodeSignWrapper.ps1 -Path <file|directory> [options]
+
+Options:
+  -Include <patterns>         File patterns to include (default: *.ps1, *.exe, etc)
+  -Exclude <patterns>         File patterns to exclude
+  -CertificateName <name>     Use specific certificate
+  -RememberCertificate        Remember last used certificate
+  -Recurse                   Process directories recursively
+  -Force                     Force re-signing of already signed files
+  -UpdateTools               Force re-download of AzureSignTool/Cosign
+  -UseContainerSigning       Use Cosign for container signing
+  -Help                      Show this help message
+  -Version                   Show script and tool versions
+  -DryRun                    Show what would be signed, but do not sign
+
+See README.md for full documentation.
+"@
+        exit 0
+    }
+
+    if ($Version) {
+        Write-Host "CodeSignWrapper.ps1 version 1.4.0"
+        Write-Host "AzureSignTool: v6.0.1"
+        Write-Host "Cosign: v2.2.3"
+        exit 0
+    }
+
+    # Ensure script can find its dependencies regardless of where it's run from
+    $scriptPath = $MyInvocation.MyCommand.Path
+    $scriptDir = Split-Path -Parent $scriptPath
+    
+    # Update paths to be relative to script location
+    $ConfigPath = Join-Path $scriptDir "config.json"
+    $LogDir = Join-Path $scriptDir "logs"
+    $credentialManagerPath = Join-Path $scriptDir "CredentialManager.ps1"
+    $lastUsedCertPath = Join-Path $scriptDir "lastcert.txt"
+    
+    # Create directories if they don't exist
+    if (-not (Test-Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+    }
+
+    # Initialize log file with timestamp
+    $LogFile = Join-Path $LogDir ("signing_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+
+    # Enhanced SIEM logging for better visibility
+    function Send-ToSIEM {
+        param(
+            [string]$Message,
+            [string]$Level = "INFO",
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$ForceSend = $false
+        )
+        
+        # Only send to SIEM if explicitly forced or if EnableSIEM is true
+        # This allows us to collect logs but only send the final summary
+        if ((-not $EnableSIEM) -and (-not $ForceSend)) { return }
+        
+        try {
+            # Create a structured log event with Exabeam expected fields
+            $eventProperties = @{
+                # Standard Exabeam fields based on your screenshot
+                "activity" = $EventType
+                "activity_type" = "code-signing"  
+                "landscape" = "endpoint security"
+                # Improved mapping of log levels to outcomes
+                "outcome" = switch ($Level) {
+                    "SUCCESS" { "success" }
+                    "ERROR" { "failure" }
+                    "WARN" { "warning" }
+                    "INFO" { "informational" }
+                    default { "informational" }
+                }
+                "platform" = "Windows"
+                "product" = "CodeSignWrapper"
+                "product_category" = "security operation"
+                "subject" = $Action
+                "time" = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                "vendor" = "Teledyne"
+                "src_ip" = [string](Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne "127.0.0.1" } | Select-Object -First 1 -ExpandProperty IPAddress)
+                "user" = $env:USERNAME
+                "host" = $env:COMPUTERNAME
+                "Message" = $Message
+            }
+            
+            # Add any additional properties 
+            foreach ($key in $Properties.Keys) {
+                $eventProperties[$key] = $Properties[$key]
+            }
+            
+            # Convert to JSON for better parsing in SIEM
+            $jsonEvent = $eventProperties | ConvertTo-Json -Compress
+            
+            if ($SIEMProtocol -eq "TCP") {
+                $client = New-Object System.Net.Sockets.TcpClient
+                $client.Connect($SIEMServer, $SIEMPort)
+                $stream = $client.GetStream()
+                $writer = New-Object System.IO.StreamWriter($stream)
+                $writer.WriteLine($jsonEvent)
+                $writer.Flush()
+                $writer.Close()
+                $stream.Close()
+                $client.Close()
+            }
+            else { # UDP
+                $endpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($SIEMServer), $SIEMPort)
+                $udpClient = New-Object System.Net.Sockets.UdpClient
+                $bytes = [System.Text.Encoding]::ASCII.GetBytes($jsonEvent)
+                $udpClient.Send($bytes, $bytes.Length, $endpoint)
+                $udpClient.Close()
+            }
+        }
+        catch {
+            # Log error locally but don't fail the main operation
+            $errorMessage = "Failed to send to SIEM: $_"
+            Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] $errorMessage"
+            Write-Host $errorMessage -ForegroundColor Red
+        }
+    }
+    
+    function Write-Log {
+        <#
+        .SYNOPSIS
+            Writes formatted log messages to both file and console, and SIEM if enabled
+        .DESCRIPTION
+            Handles logging of messages with timestamps and different severity levels,
+            writing to a log file, optionally to the console with color coding,
+            and to SIEM if enabled.
+        .PARAMETER Message
+            The message to log
+        .PARAMETER Level
+            The severity level (INFO, WARN, ERROR, SUCCESS)
+        .PARAMETER Console
+            Switch to indicate if message should also be written to console
+        .PARAMETER Properties
+            Additional properties to include in SIEM logs as a hashtable
+        #>
+        param(
+            [string]$Message,
+            [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS')]
+            [string]$Level = "INFO",
+            [switch]$Console,
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$SendToSIEM = $false
+        )
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $logMessage = "$timestamp [$Level] $Message"
+        
+        # Write to log file
+        Add-Content -Path $LogFile -Value $logMessage
+        
+        # Write to console if requested or for important messages
+        if ($Console -or $Level -in @('ERROR', 'SUCCESS') -or $VerbosePreference -eq 'Continue') {
+            $color = switch ($Level) {
+                'ERROR' { 'Red' }
+                'WARN'  { 'Yellow' }
+                'SUCCESS' { 'Green' }
+                default { 'Gray' }
+            }
+            Write-Host $logMessage -ForegroundColor $color
+        }
+        
+        # Only send to SIEM if explicitly requested now - we'll do a comprehensive send at the end
+        if ($SendToSIEM) {
+            Send-ToSIEM -Message $Message -Level $Level -EventType $EventType -Action $Action -Properties $Properties
+        }
+    }
+
+    if ($Help) {
+        Write-Host @"
+CodeSignWrapper.ps1 - Sign files and containers using Azure Key Vault certificates
+
+Usage:
+  .\CodeSignWrapper.ps1 -Path <file|directory> [options]
+
+Options:
+  -Include <patterns>         File patterns to include (default: *.ps1, *.exe, etc)
+  -Exclude <patterns>         File patterns to exclude
+  -CertificateName <name>     Use specific certificate
+  -RememberCertificate        Remember last used certificate
+  -Recurse                   Process directories recursively
+  -Force                     Force re-signing of already signed files
+  -UpdateTools               Force re-download of AzureSignTool/Cosign
+  -UseContainerSigning       Use Cosign for container signing
+  -Help                      Show this help message
+  -Version                   Show script and tool versions
+  -DryRun                    Show what would be signed, but do not sign
+
+See README.md for full documentation.
+"@
+        exit 0
+    }
+
+    if ($Version) {
+        Write-Host "CodeSignWrapper.ps1 version 1.4.0"
+        Write-Host "AzureSignTool: v6.0.1"
+        Write-Host "Cosign: v2.2.3"
+        exit 0
+    }
+
+    # Ensure script can find its dependencies regardless of where it's run from
+    $scriptPath = $MyInvocation.MyCommand.Path
+    $scriptDir = Split-Path -Parent $scriptPath
+    
+    # Update paths to be relative to script location
+    $ConfigPath = Join-Path $scriptDir "config.json"
+    $LogDir = Join-Path $scriptDir "logs"
+    $credentialManagerPath = Join-Path $scriptDir "CredentialManager.ps1"
+    $lastUsedCertPath = Join-Path $scriptDir "lastcert.txt"
+    
+    # Create directories if they don't exist
+    if (-not (Test-Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+    }
+
+    # Initialize log file with timestamp
+    $LogFile = Join-Path $LogDir ("signing_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+
+    # Enhanced SIEM logging for better visibility
+    function Send-ToSIEM {
+        param(
+            [string]$Message,
+            [string]$Level = "INFO",
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$ForceSend = $false
+        )
+        
+        # Only send to SIEM if explicitly forced or if EnableSIEM is true
+        # This allows us to collect logs but only send the final summary
+        if ((-not $EnableSIEM) -and (-not $ForceSend)) { return }
+        
+        try {
+            # Create a structured log event with Exabeam expected fields
+            $eventProperties = @{
+                # Standard Exabeam fields based on your screenshot
+                "activity" = $EventType
+                "activity_type" = "code-signing"  
+                "landscape" = "endpoint security"
+                # Improved mapping of log levels to outcomes
+                "outcome" = switch ($Level) {
+                    "SUCCESS" { "success" }
+                    "ERROR" { "failure" }
+                    "WARN" { "warning" }
+                    "INFO" { "informational" }
+                    default { "informational" }
+                }
+                "platform" = "Windows"
+                "product" = "CodeSignWrapper"
+                "product_category" = "security operation"
+                "subject" = $Action
+                "time" = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                "vendor" = "Teledyne"
+                "src_ip" = [string](Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne "127.0.0.1" } | Select-Object -First 1 -ExpandProperty IPAddress)
+                "user" = $env:USERNAME
+                "host" = $env:COMPUTERNAME
+                "Message" = $Message
+            }
+            
+            # Add any additional properties 
+            foreach ($key in $Properties.Keys) {
+                $eventProperties[$key] = $Properties[$key]
+            }
+            
+            # Convert to JSON for better parsing in SIEM
+            $jsonEvent = $eventProperties | ConvertTo-Json -Compress
+            
+            if ($SIEMProtocol -eq "TCP") {
+                $client = New-Object System.Net.Sockets.TcpClient
+                $client.Connect($SIEMServer, $SIEMPort)
+                $stream = $client.GetStream()
+                $writer = New-Object System.IO.StreamWriter($stream)
+                $writer.WriteLine($jsonEvent)
+                $writer.Flush()
+                $writer.Close()
+                $stream.Close()
+                $client.Close()
+            }
+            else { # UDP
+                $endpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($SIEMServer), $SIEMPort)
+                $udpClient = New-Object System.Net.Sockets.UdpClient
+                $bytes = [System.Text.Encoding]::ASCII.GetBytes($jsonEvent)
+                $udpClient.Send($bytes, $bytes.Length, $endpoint)
+                $udpClient.Close()
+            }
+        }
+        catch {
+            # Log error locally but don't fail the main operation
+            $errorMessage = "Failed to send to SIEM: $_"
+            Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] $errorMessage"
+            Write-Host $errorMessage -ForegroundColor Red
+        }
+    }
+    
+    function Write-Log {
+        <#
+        .SYNOPSIS
+            Writes formatted log messages to both file and console, and SIEM if enabled
+        .DESCRIPTION
+            Handles logging of messages with timestamps and different severity levels,
+            writing to a log file, optionally to the console with color coding,
+            and to SIEM if enabled.
+        .PARAMETER Message
+            The message to log
+        .PARAMETER Level
+            The severity level (INFO, WARN, ERROR, SUCCESS)
+        .PARAMETER Console
+            Switch to indicate if message should also be written to console
+        .PARAMETER Properties
+            Additional properties to include in SIEM logs as a hashtable
+        #>
+        param(
+            [string]$Message,
+            [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS')]
+            [string]$Level = "INFO",
+            [switch]$Console,
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$SendToSIEM = $false
+        )
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $logMessage = "$timestamp [$Level] $Message"
+        
+        # Write to log file
+        Add-Content -Path $LogFile -Value $logMessage
+        
+        # Write to console if requested or for important messages
+        if ($Console -or $Level -in @('ERROR', 'SUCCESS') -or $VerbosePreference -eq 'Continue') {
+            $color = switch ($Level) {
+                'ERROR' { 'Red' }
+                'WARN'  { 'Yellow' }
+                'SUCCESS' { 'Green' }
+                default { 'Gray' }
+            }
+            Write-Host $logMessage -ForegroundColor $color
+        }
+        
+        # Only send to SIEM if explicitly requested now - we'll do a comprehensive send at the end
+        if ($SendToSIEM) {
+            Send-ToSIEM -Message $Message -Level $Level -EventType $EventType -Action $Action -Properties $Properties
+        }
+    }
+
+    # Check for required files (only require CredentialManager; tools are downloaded on demand)
+    # Only CredentialManager is required at startup; the signing tools are managed/downloaded on demand
+    if (-not (Test-Path $credentialManagerPath)) {
+        Write-Host "Required file 'CredentialManager.ps1' not found in script directory." -ForegroundColor Red
+        Write-Host "Download it from: https://github.com/TeledyneDevOps/CodeSigning" -ForegroundColor Yellow
+        exit 1
     }
 
     # Check if $LogDir is writable
@@ -524,8 +1228,12 @@ See README.md for full documentation.
             The tool is downloaded from GitHub if not present or if Force is specified.
             A backup is created during updates to ensure recoverability.
         #>
-        $toolPath = "$PSScriptRoot\AzureSignTool-x64.exe"
-        if ((Test-Path $toolPath) -and (-not $Force)) { return $toolPath }
+        $toolPath = Join-Path $scriptDir "AzureSignTool-x64.exe"
+        # If tool already exists and user did not request tool update, reuse it
+        if (Test-Path $toolPath -and -not $UpdateTools) {
+            Write-Log "Azure Sign Tool found at $toolPath, not downloading." -Console
+            return $toolPath
+        }
 
         try {
             Write-Log "Downloading Azure Sign Tool..." -Console
@@ -564,8 +1272,12 @@ See README.md for full documentation.
             A backup is created during updates to ensure recoverability.
             Cosign v2.2.3 is used for container signing with Azure Key Vault integration.
         #>
-        $toolPath = "$PSScriptRoot\cosign.exe"
-        if ((Test-Path $toolPath) -and (-not $Force)) { return $toolPath }
+        $toolPath = Join-Path $scriptDir "cosign.exe"
+        # If cosign already exists and user did not request tool update, reuse it
+        if (Test-Path $toolPath -and -not $UpdateTools) {
+            Write-Log "Cosign found at $toolPath, not downloading." -Console
+            return $toolPath
+        }
         
         try {
             Write-Log "Downloading Cosign tool for container signing..." -Console
@@ -1035,629 +1747,81 @@ Process {
             }
             
             Write-Log "Azure Sign Tool validation successful" -Level SUCCESS -Console
-            Write-Log "Proceeding with certificate: $CertificateName" -Level INFO -Console
         }
         catch {
-            Write-Log "Tool validation failed: $_" -Level ERROR -Console
-            Write-Log "Common issues:" -Level WARN -Console
-            Write-Log " - Certificate name mismatch" -Level WARN -Console
-            Write-Log " - Insufficient KeyVault permissions" -Level WARN -Console
-            Write-Log " - Invalid Key Vault secret" -Level WARN -Console
-            throw
+            Write-Log $_.Exception.Message -Level ERROR -Console
+            throw "Certificate verification failed: $_"
         }
 
-        # Get list of files to process with proper recursion and single file support (Ankit's improvement)
+        # Collect files to sign
+        $filesToSign = @()
+        $containersToSign = @()
+
+        # New: Support direct file input for signing
         if (Test-Path $Path -PathType Leaf) {
-            # Single file
-            $files = @()
-            if (Test-FileSignable $Path) {
-                $files += Get-Item $Path
+            # Single file provided, add to signing list
+            if (Test-FileSignable -FilePath $Path) {
+                $filesToSign += $Path
             }
-        } else {
-            # Directory
-            $files = @(Get-ChildItem -Path $Path -File -Recurse:$Recurse | 
-                    Where-Object { Test-FileSignable $_.FullName })
         }
-        
-        $stats.Total = @($files).Count
-        Write-Log "Found $($stats.Total) files to process" -Console
-        
-        # Add progress bar and counters
-        $activity = "Signing files with certificate '$CertificateName'"
-        $fileCounter = 0
-        
-        foreach ($file in $files) {
+        else {
+            # Directory or wildcard path, collect matching files
+            $searchPath = if ($Recurse) { "$Path\*" } else { $Path }
+            $filesToSign = Get-ChildItem -Path $searchPath -Include $Include -Exclude $Exclude -Recurse:$Recurse -File -ErrorAction SilentlyContinue
+
+            # Filter files based on signable criteria
+            $filesToSign = $filesToSign | Where-Object { Test-FileSignable -FilePath $_.FullName }
+        }
+
+        # Log and exit if no files found to sign
+        if ($filesToSign.Count -eq 0) {
+            Write-Log "No files found to sign in the specified path: $Path" -Level WARN -Console
+            exit 0
+        }
+
+        # Sign each file
+        foreach ($file in $filesToSign) {
             try {
-                $fileCounter++
-                $progressPercent = [Math]::Min(($fileCounter / $stats.Total * 100), 100)
-                
-                # Update progress bar with detailed status
-                $status = "Processing file $fileCounter of $($stats.Total): $($file.Name)"
-                $statusDetail = "Success: $($stats.Success) | Failed: $($stats.Failed) | Skipped: $($stats.Skipped)"
-                Write-Progress -Activity $activity -Status $status -PercentComplete $progressPercent -CurrentOperation $statusDetail
-                
-                Write-Log "Processing: $($file.FullName)" -Console
-                
-                # Get pre-signing certificate info if exists
-                $preSig = Get-AuthenticodeSignature $file.FullName
-                if ($preSig.Status -eq "Valid") {
-                    Write-Log "File already signed by: $($preSig.SignerCertificate.Subject)" -Level WARN -Console
-                }
+                $filePath = $file.FullName
+                Write-Log "Signing file: $filePath" -Console
 
-                # Get file extension
-                $extension = [System.IO.Path]::GetExtension($file.Name).ToLower()
-                
-                # Determine if special parameters are needed for this file type
-                $additionalParams = @()
-                
-                # Handle container signing with Cosign
-                if ($extension -in @('.container', '.tar', '.oci') -or $UseContainerSigning) {
-                    # Download Cosign if not already available
-                    if (-not $cosignPath) {
-                        $cosignPath = Get-Cosign
-                    }
-                    
-                    # Get container reference - either direct path or content of reference file
-                    $containerRef = $file.FullName
-                    if ($file.Extension -in @('.container', '.txt')) {
-                        # If the file is a reference file, read the reference from its content
-                        $containerRef = Get-Content $file.FullName -Raw
-                    }
-                    
-                    Write-Log "Signing container: $containerRef with Cosign" -Console
-                    
-                    if ($PSCmdlet.ShouldProcess($file.FullName, "Sign Container")) {
-                        # Set up environment variables required by Cosign for Azure Key Vault access
-                        $env:COSIGN_AZUREKMS_RESOURCEID = $config.KeyVaultUrl
-                        $env:COSIGN_AZUREKMS_CLIENTID = $config.ClientId
-                        $env:COSIGN_AZUREKMS_TENANT = $config.TenantId
-                        
-                        try {
-                            # Prepare Cosign command-line arguments - ensure proper quoting
-                            $signArgs = @(
-                                "sign",
-                                "--key", "azurekms://$($config.KeyVaultUrl)/$CertificateName",
-                                "`"$containerRef`""  # Ensure path is quoted to handle spaces
-                            )
-                            
-                            # Execute Cosign with properly quoted arguments
-                            $processStartInfo = New-Object System.Diagnostics.ProcessStartInfo
-                            $processStartInfo.FileName = $cosignPath
-                            $processStartInfo.Arguments = $signArgs -join ' '
-                            $processStartInfo.RedirectStandardError = $true
-                            $processStartInfo.UseShellExecute = $false
-                            $processStartInfo.CreateNoWindow = $true
-                            
-                            $process = New-Object System.Diagnostics.Process
-                            $process.StartInfo = $processStartInfo
-                            [void]$process.Start()
-                            $stderr = $process.StandardError.ReadToEnd()
-                            $process.WaitForExit()
-                            
-                            # Check for errors
-                            if ($process.ExitCode -ne 0) { 
-                                $stderr | Out-File "$LogDir\stderr.txt"
-                                throw "Container signing failed with exit code $($process.ExitCode). Details: $stderr"
-                            }
-                            
-                            # Log successful signing
-                            $successMessage = "Successfully signed container '$containerRef' using Cosign with certificate '$CertificateName'"
-                            Write-Log $successMessage -Level SUCCESS -Console
-                            
-                            # Track signing details for reporting
-                            $signingDetails = @{
-                                "EventType" = "ContainerSigning"
-                                "Action" = "Signed"
-                                "FilePath" = $file.FullName
-                                "FileName" = $file.Name
-                                "ContainerRef" = $containerRef
-                                "FileSize" = $file.Length
-                                "FileType" = "container"
-                                "CertificateName" = $CertificateName
-                                "SignatureMethod" = "Cosign"
-                                "KeyVaultUrl" = $config.KeyVaultUrl
-                                "SignedBy" = $env:USERNAME
-                                "SignedOn" = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-                                "SignedOnComputer" = $env:COMPUTERNAME
-                            }
-                            
-                            $signedFilesDetails += $signingDetails
-                            $stats.Success++
-                            
-                            # Clean up environment variables for security
-                            $env:COSIGN_AZUREKMS_RESOURCEID = $null
-                            $env:COSIGN_AZUREKMS_CLIENTID = $null
-                            $env:COSIGN_AZUREKMS_TENANT = $null
-                        }
-                        catch {
-                            throw "Cosign signing failed: $_"
-                        }
-                    } else {
-                        $stats.Skipped++
-                    }
-                    
-                    # Skip the standard signing process for container files
-                    continue
-                }
-
-                # Specific file type handling
-                switch ($extension) {
-                    '.zip' {
-                        # ZIP files require special handling - we skip them in Test-FileSignable now
-                        # but this is left here in case we add special ZIP handling in the future
-                        Write-Log "ZIP files cannot be directly signed with Authenticode. Skipping." -Level WARN -Console
-                        continue
-                    }
-                    { $_ -in @('.msix', '.appx', '.cab', '.jar') } {
-                        # For container files that ARE supported, use appropriate parameters
-                        Write-Log "Treating $extension file as a container format" -Level INFO -Console
-                    }
-                    { $_ -in @('.msi', '.msp', '.msm') } {
-                        # Special handling for Windows Installer files (added .msm per Ankit)
-                        $additionalParams += @("--file-digest", "sha256")
-                    }
-                    default {
-                        # Default handling for executable/script files
-                    }
-                }
-
-                # In the signing section, update arguments
+                # Prepare arguments for AzureSignTool
                 $signArgs = @(
                     "sign",
-                    "--quiet",
-                    "--continue-on-error",
                     "--kvu", $config.KeyVaultUrl,
                     "--kvc", $CertificateName,
                     "--azure-key-vault-client-id", $config.ClientId,
                     "--azure-key-vault-tenant-id", $config.TenantId,
                     "--kvs", $env:AZURE_KEYVAULT_SECRET,
                     "--timestamp-rfc3161", $config.TimestampServer,
-                    "--colors"
+                    "--quiet",
+                    "--continue-on-error",
+                    "--file", $filePath
                 )
-                
-                # Add any file-specific parameters
-                $signArgs += $additionalParams
-                
-                if ($PSCmdlet.ShouldProcess($file.FullName, "Sign")) {
-                    # Create a properly quoted command line to handle spaces in paths
-                    $processStartInfo = New-Object System.Diagnostics.ProcessStartInfo
-                    $processStartInfo.FileName = $azureSignToolPath
-                    $processStartInfo.Arguments = "$($signArgs -join ' ') `"$($file.FullName)`""
-                    $processStartInfo.RedirectStandardError = $true
-                    $processStartInfo.UseShellExecute = $false
-                    $processStartInfo.CreateNoWindow = $true
-                    
-                    $process = New-Object System.Diagnostics.Process
-                    $process.StartInfo = $processStartInfo
-                    [void]$process.Start()
-                    $stderr = $process.StandardError.ReadToEnd()
-                    $process.WaitForExit()
-                    
-                    if ($process.ExitCode -ne 0) { 
-                        $stderr | Out-File "$LogDir\stderr.txt"
-                        throw "Signing failed with exit code $($process.ExitCode). Details: $stderr"
-                    }
-                    
-                    # Enhanced signature verification with structured SIEM logging
-                    $sig = Get-AuthenticodeSignature $file.FullName
-                    if ($sig.Status -eq "Valid") {
-                        # Prepare complete certificate details for structured logging
-                        $signingDetails = @{
-                            "EventType" = "CodeSigning"
-                            "Action" = "Signed"
-                            "FilePath" = $file.FullName
-                            "FileName" = $file.Name
-                            "FileSize" = $file.Length
-                            "FileType" = [System.IO.Path]::GetExtension($file.Name).TrimStart('.')
-                            "CertificateName" = $CertificateName
-                            "CertificateSubject" = $sig.SignerCertificate.Subject
-                            "CertificateIssuer" = $sig.SignerCertificate.Issuer
-                            "CertificateExpiry" = $sig.SignerCertificate.NotAfter.ToString()
-                            "CertificateThumbprint" = $sig.SignerCertificate.Thumbprint
-                            "SignatureStatus" = $sig.Status.ToString()
-                            "KeyVaultUrl" = $config.KeyVaultUrl
-                            "TimestampServer" = $config.TimestampServer
-                            "SignedBy" = $env:USERNAME
-                            "SignedOn" = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-                            "SignedOnComputer" = $env:COMPUTERNAME
-                        }
-                        
-                        # Add to our tracking array
-                        $signedFilesDetails += $signingDetails
-                        
-                        # Consolidated log message that includes all the key information
-                        $successMessage = "Successfully signed file '$($file.Name)' using certificate '$CertificateName' ($($sig.SignerCertificate.Thumbprint))"
-                        Write-Log $successMessage -Level SUCCESS -Console
-                        
-                        $stats.Success++
-                    } else {
-                        throw "Signature verification failed: $($sig.Status). StatusMessage: $($sig.StatusMessage)"
-                    }
-                } else {
-                    $stats.Skipped++
+
+                # Execute signing process
+                $processResult = Start-Process -FilePath $azureSignToolPath -ArgumentList $signArgs -NoNewWindow -Wait -PassThru
+
+                # Check exit code and log result
+                if ($processResult.ExitCode -eq 0) {
+                    Write-Log "Successfully signed: $filePath" -Level SUCCESS -Console
+                    $stats.Success++
+                }
+                else {
+                    Write-Log "Failed to sign (exit code $($processResult.ExitCode)): $filePath" -Level ERROR -Console
+                    $stats.Failed++
                 }
             }
             catch {
-                # Add enhanced error reporting to SIEM
-                $errorDetails = @{
-                    "EventType" = "CodeSigning" 
-                    "Action" = "Error"
-                    "FilePath" = $file.FullName
-                    "FileName" = $file.Name
-                    "ErrorMessage" = $_.ToString()
-                }
-                
-                Write-Log "Failed to sign $($file.Name)" -Level ERROR -Console
-                Write-Log "Error details: $_" -Level ERROR -Console
-                if (Test-Path "$LogDir\stderr.txt") {
-                    $toolOutput = Get-Content "$LogDir\stderr.txt" -Raw
-                    Write-Log "Tool output: $toolOutput" -Level ERROR -Console
-                    $errorDetails["ToolOutput"] = $toolOutput
-                }
+                Write-Log "Error signing file $filePath: $_" -Level ERROR -Console
                 $stats.Failed++
-                continue
             }
         }
-        
-        # Clear the progress bar when done
-        Write-Progress -Activity $activity -Completed
-    }
-    finally {
-        if (Test-Path "$LogDir\stderr.txt") { Remove-Item "$LogDir\stderr.txt" -Force }
-        $env:AZURE_KEYVAULT_SECRET = $null
-    }
-}
 
-End {
-    # Create a detailed file list for the summary
-    $fileList = if ($stats.Success -gt 0) {
-        ($signedFilesDetails | Select-Object -First 5 | ForEach-Object { $_.FileName }) -join ", "
-    } else { "None" }
-    
-    # Add truncation indicator if more than 5 files
-    if ($stats.Success -gt 5) {
-        $fileList += "... (and $($stats.Success - 5) more)"
+        # Final statistics log
+        Write-Log "Signing process completed. Total: $($stats.Total), Success: $($stats.Success), Failed: $($stats.Failed), Skipped: $($stats.Skipped)" -Level INFO -Console
     }
-    
-    # Only send summary to SIEM if we actually attempted to sign files
-    if ($stats.Total -gt 0) {
-        # Comprehensive summary message
-        $summaryMessage = "Code signing operation completed by $($env:USERNAME). " +
-                         "Successfully signed $($stats.Success) of $($stats.Total) files " + 
-                         "using certificate '$CertificateName'."
-        
-        # Determine the actual summary outcome based on success percentage
-        $summaryOutcome = if ($stats.Success -eq $stats.Total) {
-            "SUCCESS" # Complete success
-        } elseif ($stats.Success -gt 0) {
-            "WARN"   # Partial success
-        } else {
-            "ERROR"  # Complete failure
-        }
-        
-        # Create a complete summary for SIEM with all details
-        $siemSummary = @{
-            "TotalFiles" = $stats.Total
-            "SuccessfulSigns" = $stats.Success
-            "FailedSigns" = $stats.Failed
-            "SkippedFiles" = $stats.Skipped
-            "Certificate" = $CertificateName
-            "CertificateThumbprint" = if ($signedFilesDetails.Count -gt 0) { $signedFilesDetails[0].CertificateThumbprint } else { "N/A" }
-            "CertificateSubject" = if ($signedFilesDetails.Count -gt 0) { $signedFilesDetails[0].CertificateSubject } else { "N/A" }
-            "KeyVaultUrl" = $config.KeyVaultUrl
-            "SignedFiles" = $fileList
-            "SignedFilesDetails" = ($signedFilesDetails | Select-Object FileName, FilePath, FileSize, FileType, SignatureStatus, SignedBy, SignedOn)
-            "Operation" = "Code signing batch operation"
-            "SignedBy" = $env:USERNAME
-            "SignedByDomain" = $env:USERDOMAIN
-            "SignedOnComputer" = $env:COMPUTERNAME
-            "CompletedAt" = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-        }
-        
-        # Send to SIEM with complete details - and force sending regardless of EnableSIEM setting
-        Send-ToSIEM -Message $summaryMessage `
-                   -Level $summaryOutcome `
-                   -EventType "CodeSigningSummary" `
-                   -Action "Complete" `
-                   -Properties $siemSummary `
-                   -ForceSend
+    catch {
+        Write-Log "Unexpected error: $_" -Level ERROR -Console
     }
-    else {
-        # Special case: No files were found to sign
-        $noFilesMessage = "Code signing operation completed by $($env:USERNAME). No signable files found at '$Path'."
-        Write-Log $noFilesMessage -Level INFO -Console
-        
-        # Only send a minimal info message to SIEM for no-files-found case
-        Send-ToSIEM -Message $noFilesMessage `
-                   -Level "INFO" `
-                   -EventType "CodeSigningSummary" `
-                   -Action "NoFilesFound" `
-                   -Properties @{
-                        "Certificate" = $CertificateName
-                        "KeyVaultUrl" = $config.KeyVaultUrl
-                        "SearchPath" = $Path
-                        "Recurse" = $Recurse
-                        "SignedBy" = $env:USERNAME
-                        "SignedByDomain" = $env:USERDOMAIN
-                        "SignedOnComputer" = $env:COMPUTERNAME
-                        "CompletedAt" = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-                   } `
-                   -ForceSend
-    }
-    
-    # Enhanced console display with border
-    $border = "-" * 50
-    Write-Host "`n+$border+" -ForegroundColor Cyan
-    Write-Host "| Signing Operation Summary                          |" -ForegroundColor Cyan
-    Write-Host "+$border+" -ForegroundColor Cyan
-    Write-Host "| Certificate: $($CertificateName.PadRight(36))|" -ForegroundColor Cyan
-    
-    if ($stats.Total -gt 0) {
-        Write-Host "| Total files processed: $($stats.Total.ToString().PadRight(26))|" -ForegroundColor Cyan
-        Write-Host "| Successfully signed: $($stats.Success.ToString().PadRight(28))|" -ForegroundColor Green
-        Write-Host "| Failed to sign: $($stats.Failed.ToString().PadRight(32))|" -ForegroundColor $(if ($stats.Failed -gt 0) {"Red"} else {"Gray"})
-        Write-Host "| Skipped: $($stats.Skipped.ToString().PadRight(39))|" -ForegroundColor Gray
-    }
-    else {
-        Write-Host "| No signable files found in specified path         |" -ForegroundColor Yellow
-    }
-    
-    Write-Host "+$border+" -ForegroundColor Cyan
-    Write-Host "`nTip: To update AzureSignTool or Cosign, delete the .exe file in the script directory and rerun this script." -ForegroundColor Gray
 }
-# SIG # Begin signature block
-# MIIvjQYJKoZIhvcNAQcCoIIvfjCCL3oCAQExDzANBglghkgBZQMEAgEFADB5Bgor
-# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDNhVN5bfgUGNrx
-# ddfCxFs+9fIh7NSlBDnBEXk6t0vtX6CCFDkwggWQMIIDeKADAgECAhAFmxtXno4h
-# MuI5B72nd3VcMA0GCSqGSIb3DQEBDAUAMGIxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
-# EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xITAfBgNV
-# BAMTGERpZ2lDZXJ0IFRydXN0ZWQgUm9vdCBHNDAeFw0xMzA4MDExMjAwMDBaFw0z
-# ODAxMTUxMjAwMDBaMGIxCzAJBgNVBAYTAlVTMRUwEwYDVQQKEwxEaWdpQ2VydCBJ
-# bmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xITAfBgNVBAMTGERpZ2lDZXJ0
-# IFRydXN0ZWQgUm9vdCBHNDCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIB
-# AL/mkHNo3rvkXUo8MCIwaTPswqclLskhPfKK2FnC4SmnPVirdprNrnsbhA3EMB/z
-# G6Q4FutWxpdtHauyefLKEdLkX9YFPFIPUh/GnhWlfr6fqVcWWVVyr2iTcMKyunWZ
-# anMylNEQRBAu34LzB4TmdDttceItDBvuINXJIB1jKS3O7F5OyJP4IWGbNOsFxl7s
-# Wxq868nPzaw0QF+xembud8hIqGZXV59UWI4MK7dPpzDZVu7Ke13jrclPXuU15zHL
-# 2pNe3I6PgNq2kZhAkHnDeMe2scS1ahg4AxCN2NQ3pC4FfYj1gj4QkXCrVYJBMtfb
-# BHMqbpEBfCFM1LyuGwN1XXhm2ToxRJozQL8I11pJpMLmqaBn3aQnvKFPObURWBf3
-# JFxGj2T3wWmIdph2PVldQnaHiZdpekjw4KISG2aadMreSx7nDmOu5tTvkpI6nj3c
-# AORFJYm2mkQZK37AlLTSYW3rM9nF30sEAMx9HJXDj/chsrIRt7t/8tWMcCxBYKqx
-# YxhElRp2Yn72gLD76GSmM9GJB+G9t+ZDpBi4pncB4Q+UDCEdslQpJYls5Q5SUUd0
-# viastkF13nqsX40/ybzTQRESW+UQUOsxxcpyFiIJ33xMdT9j7CFfxCBRa2+xq4aL
-# T8LWRV+dIPyhHsXAj6KxfgommfXkaS+YHS312amyHeUbAgMBAAGjQjBAMA8GA1Ud
-# EwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgGGMB0GA1UdDgQWBBTs1+OC0nFdZEzf
-# Lmc/57qYrhwPTzANBgkqhkiG9w0BAQwFAAOCAgEAu2HZfalsvhfEkRvDoaIAjeNk
-# aA9Wz3eucPn9mkqZucl4XAwMX+TmFClWCzZJXURj4K2clhhmGyMNPXnpbWvWVPjS
-# PMFDQK4dUPVS/JA7u5iZaWvHwaeoaKQn3J35J64whbn2Z006Po9ZOSJTROvIXQPK
-# 7VB6fWIhCoDIc2bRoAVgX+iltKevqPdtNZx8WorWojiZ83iL9E3SIAveBO6Mm0eB
-# cg3AFDLvMFkuruBx8lbkapdvklBtlo1oepqyNhR6BvIkuQkRUNcIsbiJeoQjYUIp
-# 5aPNoiBB19GcZNnqJqGLFNdMGbJQQXE9P01wI4YMStyB0swylIQNCAmXHE/A7msg
-# dDDS4Dk0EIUhFQEI6FUy3nFJ2SgXUE3mvk3RdazQyvtBuEOlqtPDBURPLDab4vri
-# RbgjU2wGb2dVf0a1TD9uKFp5JtKkqGKX0h7i7UqLvBv9R0oN32dmfrJbQdA75PQ7
-# 9ARj6e/CVABRoIoqyc54zNXqhwQYs86vSYiv85KZtrPmYQ/ShQDnUBrkG5WdGaG5
-# nLGbsQAe79APT0JsyQq87kP6OnGlyE0mpTX9iV28hWIdMtKgK1TtmlfB2/oQzxm3
-# i0objwG2J5VT6LaJbVu8aNQj6ItRolb58KaAoNYes7wPD1N1KarqE3fk3oyBIa0H
-# EEcRrYc9B9F1vM/zZn4wggawMIIEmKADAgECAhAIrUCyYNKcTJ9ezam9k67ZMA0G
-# CSqGSIb3DQEBDAUAMGIxCzAJBgNVBAYTAlVTMRUwEwYDVQQKEwxEaWdpQ2VydCBJ
-# bmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xITAfBgNVBAMTGERpZ2lDZXJ0
-# IFRydXN0ZWQgUm9vdCBHNDAeFw0yMTA0MjkwMDAwMDBaFw0zNjA0MjgyMzU5NTla
-# MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5jLjFBMD8GA1UE
-# AxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBDb2RlIFNpZ25pbmcgUlNBNDA5NiBTSEEz
-# ODQgMjAyMSBDQTEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQDVtC9C
-# 0CiteLdd1TlZG7GIQvUzjOs9gZdwxbvEhSYwn6SOaNhc9es0JAfhS0/TeEP0F9ce
-# 2vnS1WcaUk8OoVf8iJnBkcyBAz5NcCRks43iCH00fUyAVxJrQ5qZ8sU7H/Lvy0da
-# E6ZMswEgJfMQ04uy+wjwiuCdCcBlp/qYgEk1hz1RGeiQIXhFLqGfLOEYwhrMxe6T
-# SXBCMo/7xuoc82VokaJNTIIRSFJo3hC9FFdd6BgTZcV/sk+FLEikVoQ11vkunKoA
-# FdE3/hoGlMJ8yOobMubKwvSnowMOdKWvObarYBLj6Na59zHh3K3kGKDYwSNHR7Oh
-# D26jq22YBoMbt2pnLdK9RBqSEIGPsDsJ18ebMlrC/2pgVItJwZPt4bRc4G/rJvmM
-# 1bL5OBDm6s6R9b7T+2+TYTRcvJNFKIM2KmYoX7BzzosmJQayg9Rc9hUZTO1i4F4z
-# 8ujo7AqnsAMrkbI2eb73rQgedaZlzLvjSFDzd5Ea/ttQokbIYViY9XwCFjyDKK05
-# huzUtw1T0PhH5nUwjewwk3YUpltLXXRhTT8SkXbev1jLchApQfDVxW0mdmgRQRNY
-# mtwmKwH0iU1Z23jPgUo+QEdfyYFQc4UQIyFZYIpkVMHMIRroOBl8ZhzNeDhFMJlP
-# /2NPTLuqDQhTQXxYPUez+rbsjDIJAsxsPAxWEQIDAQABo4IBWTCCAVUwEgYDVR0T
-# AQH/BAgwBgEB/wIBADAdBgNVHQ4EFgQUaDfg67Y7+F8Rhvv+YXsIiGX0TkIwHwYD
-# VR0jBBgwFoAU7NfjgtJxXWRM3y5nP+e6mK4cD08wDgYDVR0PAQH/BAQDAgGGMBMG
-# A1UdJQQMMAoGCCsGAQUFBwMDMHcGCCsGAQUFBwEBBGswaTAkBggrBgEFBQcwAYYY
-# aHR0cDovL29jc3AuZGlnaWNlcnQuY29tMEEGCCsGAQUFBzAChjVodHRwOi8vY2Fj
-# ZXJ0cy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkUm9vdEc0LmNydDBDBgNV
-# HR8EPDA6MDigNqA0hjJodHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRU
-# cnVzdGVkUm9vdEc0LmNybDAcBgNVHSAEFTATMAcGBWeBDAEDMAgGBmeBDAEEATAN
-# BgkqhkiG9w0BAQwFAAOCAgEAOiNEPY0Idu6PvDqZ01bgAhql+Eg08yy25nRm95Ry
-# sQDKr2wwJxMSnpBEn0v9nqN8JtU3vDpdSG2V1T9J9Ce7FoFFUP2cvbaF4HZ+N3HL
-# IvdaqpDP9ZNq4+sg0dVQeYiaiorBtr2hSBh+3NiAGhEZGM1hmYFW9snjdufE5Btf
-# Q/g+lP92OT2e1JnPSt0o618moZVYSNUa/tcnP/2Q0XaG3RywYFzzDaju4ImhvTnh
-# OE7abrs2nfvlIVNaw8rpavGiPttDuDPITzgUkpn13c5UbdldAhQfQDN8A+KVssIh
-# dXNSy0bYxDQcoqVLjc1vdjcshT8azibpGL6QB7BDf5WIIIJw8MzK7/0pNVwfiThV
-# 9zeKiwmhywvpMRr/LhlcOXHhvpynCgbWJme3kuZOX956rEnPLqR0kq3bPKSchh/j
-# wVYbKyP/j7XqiHtwa+aguv06P0WmxOgWkVKLQcBIhEuWTatEQOON8BUozu3xGFYH
-# Ki8QxAwIZDwzj64ojDzLj4gLDb879M4ee47vtevLt/B3E+bnKD+sEq6lLyJsQfmC
-# XBVmzGwOysWGw/YmMwwHS6DTBwJqakAwSEs0qFEgu60bhQjiWQ1tygVQK+pKHJ6l
-# /aCnHwZ05/LWUpD9r4VIIflXO7ScA+2GRfS0YW6/aOImYIbqyK+p/pQd52MbOoZW
-# eE4wggftMIIF1aADAgECAhABg0HAZ+Xwq/zP2GToyihnMA0GCSqGSIb3DQEBCwUA
-# MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5jLjFBMD8GA1UE
-# AxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBDb2RlIFNpZ25pbmcgUlNBNDA5NiBTSEEz
-# ODQgMjAyMSBDQTEwHhcNMjUwMTIzMDAwMDAwWhcNMjgwMTI1MjM1OTU5WjCB9TET
-# MBEGCysGAQQBgjc8AgEDEwJVUzEZMBcGCysGAQQBgjc8AgECEwhEZWxhd2FyZTEd
-# MBsGA1UEDwwUUHJpdmF0ZSBPcmdhbml6YXRpb24xEDAOBgNVBAUTBzMwODMwNTQx
-# CzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQHEw1UaG91
-# c2FuZCBPYWtzMSswKQYDVQQKEyJUZWxlZHluZSBUZWNobm9sb2dpZXMgSW5jb3Jw
-# b3JhdGVkMSswKQYDVQQDEyJUZWxlZHluZSBUZWNobm9sb2dpZXMgSW5jb3Jwb3Jh
-# dGVkMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAjKpnX528gwhrmne0
-# Z2lXDsWht9HiWWYzGkMP8iDix0Mge2ZgBiWw8NgA/DHmj1tCzgFbB8Kc9/Lh4w5R
-# lNPs0M2g+QyE7DJtaTMsOj8mIP6ThdxoDfohyyB17hPLlDX1sYcw/w3nuuRAE3Qk
-# yqhRiReU6E37ew8ktxOPEa0y2me3EMEiWz16I6T+dlGYPzBZUUCQ9rfFS1zVpcPe
-# eFaGFGSh2WMh9bYbsG/xUni81/r5MJb4U+PJrzQWWnclXaIMXMsoCJsvPEkuGJDj
-# 72SYJ7zcezsSyieD7uLIr+Ctm9bNWejYBZie/2yY7cO5oW4FcWYlkTIR9mpPn6tf
-# WkpMdSyEaqCgRw2xk1SxA5qr/MBjXQBaugkq16PgtnkQfZJHtBoNhEZ++8ehPOUf
-# 9fBVyGK84OUy0q7fAuyt6pHlBqe7UPKzR51dDr9wrDEZqAe8vXVjWjX+fHVUM/xv
-# 9cVXC02ft1cevLlxu8HOirARnsHtsmlIuVMRthOmAZ14WXZOV+sIU9kiBl0RZuzP
-# gy/M3Arn10nS9rcVMIvgoPt9qsGIoR/9OQT/WlC4KuVX2ta12WEcz7bMG9etwm4s
-# 6erUhMfkmfYZ6fgzgcydzBcLHRu2ZWCEfA8zJ/jVagGThjPsyUjaY4fXckFocKcK
-# xabPQBxRYTAEVjD5lq/Wh6Nu0TsCAwEAAaOCAgIwggH+MB8GA1UdIwQYMBaAFGg3
-# 4Ou2O/hfEYb7/mF7CIhl9E5CMB0GA1UdDgQWBBT97y3EZzfmedAajrEbfWpGub+F
-# bzA9BgNVHSAENjA0MDIGBWeBDAEDMCkwJwYIKwYBBQUHAgEWG2h0dHA6Ly93d3cu
-# ZGlnaWNlcnQuY29tL0NQUzAOBgNVHQ8BAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYB
-# BQUHAwMwgbUGA1UdHwSBrTCBqjBToFGgT4ZNaHR0cDovL2NybDMuZGlnaWNlcnQu
-# Y29tL0RpZ2lDZXJ0VHJ1c3RlZEc0Q29kZVNpZ25pbmdSU0E0MDk2U0hBMzg0MjAy
-# MUNBMS5jcmwwU6BRoE+GTWh0dHA6Ly9jcmw0LmRpZ2ljZXJ0LmNvbS9EaWdpQ2Vy
-# dFRydXN0ZWRHNENvZGVTaWduaW5nUlNBNDA5NlNIQTM4NDIwMjFDQTEuY3JsMIGU
-# BggrBgEFBQcBAQSBhzCBhDAkBggrBgEFBQcwAYYYaHR0cDovL29jc3AuZGlnaWNl
-# cnQuY29tMFwGCCsGAQUFBzAChlBodHRwOi8vY2FjZXJ0cy5kaWdpY2VydC5jb20v
-# RGlnaUNlcnRUcnVzdGVkRzRDb2RlU2lnbmluZ1JTQTQwOTZTSEEzODQyMDIxQ0Ex
-# LmNydDAJBgNVHRMEAjAAMA0GCSqGSIb3DQEBCwUAA4ICAQAKDwZT38qesrKUO8mC
-# PFihP4sW90EAJj3ECQRP4JV3e2KizMeZGA8c9wn5aUjNyrq11U0NXe7MrPeGP5v4
-# xZhHMQC2iIq1ZI6z6D4bgBOo8q8mX4L/e3XYqCpgyXQq6a6kdZhnA0i6GtKNfrVO
-# WeAar4nObk/2lTJtLfw1q/KHzYUYtJSUFPl031tyUAg969xbhUiX09CI+l3E7C7y
-# zeZcQ2aqSy3qdYAz1BQCr3sK50AohAlTNOZD2TDJDA3vdsbIPSWpFT8SPeLQMMD+
-# jJPKiTiFs/anjUvZFbURcdT517/BBupC7FjzQRBWS4A3AiodRv1cBeEy0j7rdFMU
-# fqk1ONh+tdxrxPCj+e1e7tjgpyppOVyYfGMsvxqXR7quTZnni//fOzI7vRxlzrBS
-# epsHelnSVRae62IFvCz9eh5qzksL72EZVHvBSb6f3ZPQ/N7t8UmfBs5vnQ4O/o8E
-# 7T81BllWuNSh6pv5M37VN5BQaRRRyRYgG4bEn2Q0l6tnRlr+4FNluv/lijFA2gUZ
-# Yw2P+owlX/Q5TIgL9HAfN0LlQy4ZKsBmD42bslA8lBe0363fFc/5FKRpB7YiUGC4
-# qQ5Au65g67V/ElU8ks3xzE1evYVFvckWXWot6tNX9b5FFfW2FqhSAD3hwsz5VjcO
-# lGSgOYajIVk1aK52IJz8WgCXrDGCGqowghqmAgEBMH0waTELMAkGA1UEBhMCVVMx
-# FzAVBgNVBAoTDkRpZ2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVz
-# dGVkIEc0IENvZGUgU2lnbmluZyBSU0E0MDk2IFNIQTM4NCAyMDIxIENBMQIQAYNB
-# wGfl8Kv8z9hk6MooZzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3AgEMMQow
-# CKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisGAQQBgjcC
-# AQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAVFHGQHtv/QwUx21Hv
-# bFvdSBpk8XJtd+hcjVKoBiUfRTANBgkqhkiG9w0BAQEFAASCAgAFNS3VlVHG+3GF
-# EVuv0RWgB9hzQdqwrdn+bZXGVSynsuv9zma1lSctzBp4J7mRvlCq7iqBP87W6kCW
-# hmJaXBvPCfncJBwsgqENA6qqMRDKazCFt8ASYEt1Snc+uDmECZ0+cuCabG+G4+pp
-# 8gEGZILqZDXJpDBL0EgwYhQ7LOyNf/dh5Ia7s1MMpZLYqB49xC734AnA/RnVdYOi
-# E115mPF9sU5Nd5kL8jpviQseM5yXVkA38ZODmtP+NVwk63mTDH5/mh9zAbNlO6VJ
-# JNOD3fKdbewjdmDVw4swztCEGeNSb/FTCRmNV8uf5krCypiwPGyLC+ah4giPHQ0G
-# xB3ue89oHXWyJHxR4pFPn/837BaPa+lVmLidBfo2YJA155Jkt1IEdqfSFOuq/T+j
-# WWAOldpxtNqdySCviLpgqzjhl2Q1UkPgi255AcUSKbXfgTCkw7er+q5uw/M2Tqba
-# iIMsdk4D6RI1mUo3lT8MrcyavDHDo/GLEXYyh1rZhtll0GdlKTw+0PjKYzPt97P3
-# pD4YUIXNzQj9rciwqc2miiiakfhau2P0Z7fpb+8daigncjnBoUql2VbHbhXpXf31
-# qlWcNbUS4fCe41e7y5rplkjAslChr8j79ZQIqXmxRYgpc30yvISOY9gRhMyeJxbd
-# RFV6uvVW4M5zni8OKA1ljfwZniS0dKGCF3cwghdzBgorBgEEAYI3AwMBMYIXYzCC
-# F18GCSqGSIb3DQEHAqCCF1AwghdMAgEDMQ8wDQYJYIZIAWUDBAIBBQAweAYLKoZI
-# hvcNAQkQAQSgaQRnMGUCAQEGCWCGSAGG/WwHATAxMA0GCWCGSAFlAwQCAQUABCCB
-# Ss2dgi+5a1xn7PBhkZ5FCy5L+ia8ewCzm/P2Dtnq0AIRANmxprfRKQ7U1u1GSunq
-# tBkYDzIwMjUwNzEwMTcyMzA0WqCCEzowggbtMIIE1aADAgECAhAKgO8YS43xBYLR
-# xHanlXRoMA0GCSqGSIb3DQEBCwUAMGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5E
-# aWdpQ2VydCwgSW5jLjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1l
-# U3RhbXBpbmcgUlNBNDA5NiBTSEEyNTYgMjAyNSBDQTEwHhcNMjUwNjA0MDAwMDAw
-# WhcNMzYwOTAzMjM1OTU5WjBjMQswCQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNl
-# cnQsIEluYy4xOzA5BgNVBAMTMkRpZ2lDZXJ0IFNIQTI1NiBSU0E0MDk2IFRpbWVz
-# dGFtcCBSZXNwb25kZXIgMjAyNSAxMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIIC
-# CgKCAgEA0EasLRLGntDqrmBWsytXum9R/4ZwCgHfyjfMGUIwYzKomd8U1nH7C8Dr
-# 0cVMF3BsfAFI54um8+dnxk36+jx0Tb+k+87H9WPxNyFPJIDZHhAqlUPt281mHrBb
-# ZHqRK71Em3/hCGC5KyyneqiZ7syvFXJ9A72wzHpkBaMUNg7MOLxI6E9RaUueHTQK
-# WXymOtRwJXcrcTTPPT2V1D/+cFllESviH8YjoPFvZSjKs3SKO1QNUdFd2adw44wD
-# cKgH+JRJE5Qg0NP3yiSyi5MxgU6cehGHr7zou1znOM8odbkqoK+lJ25LCHBSai25
-# CFyD23DZgPfDrJJJK77epTwMP6eKA0kWa3osAe8fcpK40uhktzUd/Yk0xUvhDU6l
-# vJukx7jphx40DQt82yepyekl4i0r8OEps/FNO4ahfvAk12hE5FVs9HVVWcO5J4dV
-# mVzix4A77p3awLbr89A90/nWGjXMGn7FQhmSlIUDy9Z2hSgctaepZTd0ILIUbWuh
-# KuAeNIeWrzHKYueMJtItnj2Q+aTyLLKLM0MheP/9w6CtjuuVHJOVoIJ/DtpJRE7C
-# e7vMRHoRon4CWIvuiNN1Lk9Y+xZ66lazs2kKFSTnnkrT3pXWETTJkhd76CIDBbTR
-# ofOsNyEhzZtCGmnQigpFHti58CSmvEyJcAlDVcKacJ+A9/z7eacCAwEAAaOCAZUw
-# ggGRMAwGA1UdEwEB/wQCMAAwHQYDVR0OBBYEFOQ7/PIx7f391/ORcWMZUEPPYYzo
-# MB8GA1UdIwQYMBaAFO9vU0rp5AZ8esrikFb2L9RJ7MtOMA4GA1UdDwEB/wQEAwIH
-# gDAWBgNVHSUBAf8EDDAKBggrBgEFBQcDCDCBlQYIKwYBBQUHAQEEgYgwgYUwJAYI
-# KwYBBQUHMAGGGGh0dHA6Ly9vY3NwLmRpZ2ljZXJ0LmNvbTBdBggrBgEFBQcwAoZR
-# aHR0cDovL2NhY2VydHMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0VHJ1c3RlZEc0VGlt
-# ZVN0YW1waW5nUlNBNDA5NlNIQTI1NjIwMjVDQTEuY3J0MF8GA1UdHwRYMFYwVKBS
-# oFCGTmh0dHA6Ly9jcmwzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRp
-# bWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNybDAgBgNVHSAEGTAXMAgG
-# BmeBDAEEAjALBglghkgBhv1sBwEwDQYJKoZIhvcNAQELBQADggIBAGUqrfEcJwS5
-# rmBB7NEIRJ5jQHIh+OT2Ik/bNYulCrVvhREafBYF0RkP2AGr181o2YWPoSHz9iZE
-# N/FPsLSTwVQWo2H62yGBvg7ouCODwrx6ULj6hYKqdT8wv2UV+Kbz/3ImZlJ7YXwB
-# D9R0oU62PtgxOao872bOySCILdBghQ/ZLcdC8cbUUO75ZSpbh1oipOhcUT8lD8QA
-# GB9lctZTTOJM3pHfKBAEcxQFoHlt2s9sXoxFizTeHihsQyfFg5fxUFEp7W42fNBV
-# N4ueLaceRf9Cq9ec1v5iQMWTFQa0xNqItH3CPFTG7aEQJmmrJTV3Qhtfparz+BW6
-# 0OiMEgV5GWoBy4RVPRwqxv7Mk0Sy4QHs7v9y69NBqycz0BZwhB9WOfOu/CIJnzkQ
-# TwtSSpGGhLdjnQ4eBpjtP+XB3pQCtv4E5UCSDag6+iX8MmB10nfldPF9SVD7weCC
-# 3yXZi/uuhqdwkgVxuiMFzGVFwYbQsiGnoa9F5AaAyBjFBtXVLcKtapnMG3VH3EmA
-# p/jsJ3FVF3+d1SVDTmjFjLbNFZUWMXuZyvgLfgyPehwJVxwC+UpX2MSey2ueIu9T
-# HFVkT+um1vshETaWyQo8gmBto/m3acaP9QsuLj3FNwFlTxq25+T4QwX9xa6ILs84
-# ZPvmpovq90K8eWyG2N01c4IhSOxqt81nMIIGtDCCBJygAwIBAgIQDcesVwX/IZku
-# QEMiDDpJhjANBgkqhkiG9w0BAQsFADBiMQswCQYDVQQGEwJVUzEVMBMGA1UEChMM
-# RGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3d3cuZGlnaWNlcnQuY29tMSEwHwYDVQQD
-# ExhEaWdpQ2VydCBUcnVzdGVkIFJvb3QgRzQwHhcNMjUwNTA3MDAwMDAwWhcNMzgw
-# MTE0MjM1OTU5WjBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIElu
-# Yy4xQTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJT
-# QTQwOTYgU0hBMjU2IDIwMjUgQ0ExMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIIC
-# CgKCAgEAtHgx0wqYQXK+PEbAHKx126NGaHS0URedTa2NDZS1mZaDLFTtQ2oRjzUX
-# MmxCqvkbsDpz4aH+qbxeLho8I6jY3xL1IusLopuW2qftJYJaDNs1+JH7Z+QdSKWM
-# 06qchUP+AbdJgMQB3h2DZ0Mal5kYp77jYMVQXSZH++0trj6Ao+xh/AS7sQRuQL37
-# QXbDhAktVJMQbzIBHYJBYgzWIjk8eDrYhXDEpKk7RdoX0M980EpLtlrNyHw0Xm+n
-# t5pnYJU3Gmq6bNMI1I7Gb5IBZK4ivbVCiZv7PNBYqHEpNVWC2ZQ8BbfnFRQVESYO
-# szFI2Wv82wnJRfN20VRS3hpLgIR4hjzL0hpoYGk81coWJ+KdPvMvaB0WkE/2qHxJ
-# 0ucS638ZxqU14lDnki7CcoKCz6eum5A19WZQHkqUJfdkDjHkccpL6uoG8pbF0LJA
-# QQZxst7VvwDDjAmSFTUms+wV/FbWBqi7fTJnjq3hj0XbQcd8hjj/q8d6ylgxCZSK
-# i17yVp2NL+cnT6Toy+rN+nM8M7LnLqCrO2JP3oW//1sfuZDKiDEb1AQ8es9Xr/u6
-# bDTnYCTKIsDq1BtmXUqEG1NqzJKS4kOmxkYp2WyODi7vQTCBZtVFJfVZ3j7OgWmn
-# hFr4yUozZtqgPrHRVHhGNKlYzyjlroPxul+bgIspzOwbtmsgY1MCAwEAAaOCAV0w
-# ggFZMBIGA1UdEwEB/wQIMAYBAf8CAQAwHQYDVR0OBBYEFO9vU0rp5AZ8esrikFb2
-# L9RJ7MtOMB8GA1UdIwQYMBaAFOzX44LScV1kTN8uZz/nupiuHA9PMA4GA1UdDwEB
-# /wQEAwIBhjATBgNVHSUEDDAKBggrBgEFBQcDCDB3BggrBgEFBQcBAQRrMGkwJAYI
-# KwYBBQUHMAGGGGh0dHA6Ly9vY3NwLmRpZ2ljZXJ0LmNvbTBBBggrBgEFBQcwAoY1
-# aHR0cDovL2NhY2VydHMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0VHJ1c3RlZFJvb3RH
-# NC5jcnQwQwYDVR0fBDwwOjA4oDagNIYyaHR0cDovL2NybDMuZGlnaWNlcnQuY29t
-# L0RpZ2lDZXJ0VHJ1c3RlZFJvb3RHNC5jcmwwIAYDVR0gBBkwFzAIBgZngQwBBAIw
-# CwYJYIZIAYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQAXzvsWgBz+Bz0RdnEwvb4L
-# yLU0pn/N0IfFiBowf0/Dm1wGc/Do7oVMY2mhXZXjDNJQa8j00DNqhCT3t+s8G0iP
-# 5kvN2n7Jd2E4/iEIUBO41P5F448rSYJ59Ib61eoalhnd6ywFLerycvZTAz40y8S4
-# F3/a+Z1jEMK/DMm/axFSgoR8n6c3nuZB9BfBwAQYK9FHaoq2e26MHvVY9gCDA/JY
-# sq7pGdogP8HRtrYfctSLANEBfHU16r3J05qX3kId+ZOczgj5kjatVB+NdADVZKON
-# /gnZruMvNYY2o1f4MXRJDMdTSlOLh0HCn2cQLwQCqjFbqrXuvTPSegOOzr4EWj7P
-# tspIHBldNE2K9i697cvaiIo2p61Ed2p8xMJb82Yosn0z4y25xUbI7GIN/TpVfHIq
-# Q6Ku/qjTY6hc3hsXMrS+U0yy+GWqAXam4ToWd2UQ1KYT70kZjE4YtL8Pbzg0c1ug
-# MZyZZd/BdHLiRu7hAWE6bTEm4XYRkA6Tl4KSFLFk43esaUeqGkH/wyW4N7Oigizw
-# JWeukcyIPbAvjSabnf7+Pu0VrFgoiovRDiyx3zEdmcif/sYQsfch28bZeUz2rtY/
-# 9TCA6TD8dC3JE3rYkrhLULy7Dc90G6e8BlqmyIjlgp2+VqsS9/wQD7yFylIz0scm
-# bKvFoW2jNrbM1pD2T7m3XDCCBY0wggR1oAMCAQICEA6bGI750C3n79tQ4ghAGFow
-# DQYJKoZIhvcNAQEMBQAwZTELMAkGA1UEBhMCVVMxFTATBgNVBAoTDERpZ2lDZXJ0
-# IEluYzEZMBcGA1UECxMQd3d3LmRpZ2ljZXJ0LmNvbTEkMCIGA1UEAxMbRGlnaUNl
-# cnQgQXNzdXJlZCBJRCBSb290IENBMB4XDTIyMDgwMTAwMDAwMFoXDTMxMTEwOTIz
-# NTk1OVowYjELMAkGA1UEBhMCVVMxFTATBgNVBAoTDERpZ2lDZXJ0IEluYzEZMBcG
-# A1UECxMQd3d3LmRpZ2ljZXJ0LmNvbTEhMB8GA1UEAxMYRGlnaUNlcnQgVHJ1c3Rl
-# ZCBSb290IEc0MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAv+aQc2je
-# u+RdSjwwIjBpM+zCpyUuySE98orYWcLhKac9WKt2ms2uexuEDcQwH/MbpDgW61bG
-# l20dq7J58soR0uRf1gU8Ug9SH8aeFaV+vp+pVxZZVXKvaJNwwrK6dZlqczKU0RBE
-# EC7fgvMHhOZ0O21x4i0MG+4g1ckgHWMpLc7sXk7Ik/ghYZs06wXGXuxbGrzryc/N
-# rDRAX7F6Zu53yEioZldXn1RYjgwrt0+nMNlW7sp7XeOtyU9e5TXnMcvak17cjo+A
-# 2raRmECQecN4x7axxLVqGDgDEI3Y1DekLgV9iPWCPhCRcKtVgkEy19sEcypukQF8
-# IUzUvK4bA3VdeGbZOjFEmjNAvwjXWkmkwuapoGfdpCe8oU85tRFYF/ckXEaPZPfB
-# aYh2mHY9WV1CdoeJl2l6SPDgohIbZpp0yt5LHucOY67m1O+SkjqePdwA5EUlibaa
-# RBkrfsCUtNJhbesz2cXfSwQAzH0clcOP9yGyshG3u3/y1YxwLEFgqrFjGESVGnZi
-# fvaAsPvoZKYz0YkH4b235kOkGLimdwHhD5QMIR2yVCkliWzlDlJRR3S+Jqy2QXXe
-# eqxfjT/JvNNBERJb5RBQ6zHFynIWIgnffEx1P2PsIV/EIFFrb7GrhotPwtZFX50g
-# /KEexcCPorF+CiaZ9eRpL5gdLfXZqbId5RsCAwEAAaOCATowggE2MA8GA1UdEwEB
-# /wQFMAMBAf8wHQYDVR0OBBYEFOzX44LScV1kTN8uZz/nupiuHA9PMB8GA1UdIwQY
-# MBaAFEXroq/0ksuCMS1Ri6enIZ3zbcgPMA4GA1UdDwEB/wQEAwIBhjB5BggrBgEF
-# BQcBAQRtMGswJAYIKwYBBQUHMAGGGGh0dHA6Ly9vY3NwLmRpZ2ljZXJ0LmNvbTBD
-# BggrBgEFBQcwAoY3aHR0cDovL2NhY2VydHMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0
-# QXNzdXJlZElEUm9vdENBLmNydDBFBgNVHR8EPjA8MDqgOKA2hjRodHRwOi8vY3Js
-# My5kaWdpY2VydC5jb20vRGlnaUNlcnRBc3N1cmVkSURSb290Q0EuY3JsMBEGA1Ud
-# IAQKMAgwBgYEVR0gADANBgkqhkiG9w0BAQwFAAOCAQEAcKC/Q1xV5zhfoKN0Gz22
-# Ftf3v1cHvZqsoYcs7IVeqRq7IviHGmlUIu2kiHdtvRoU9BNKei8ttzjv9P+Aufih
-# 9/Jy3iS8UgPITtAq3votVs/59PesMHqai7Je1M/RQ0SbQyHrlnKhSLSZy51PpwYD
-# E3cnRNTnf+hZqPC/Lwum6fI0POz3A8eHqNJMQBk1RmppVLC4oVaO7KTVPeix3P0c
-# 2PR3WlxUjG/voVA9/HYJaISfb8rbII01YBwCA8sgsKxYoA5AY8WYIsGyWfVVa88n
-# q2x2zm8jLfR+cWojayL/ErhULSd+2DrZ8LaHlv1b0VysGMNNn3O3AamfV6peKOK5
-# lDGCA3wwggN4AgEBMH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lDZXJ0
-# LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVTdGFtcGlu
-# ZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0aDANBglg
-# hkgBZQMEAgEFAKCB0TAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQwHAYJKoZI
-# hvcNAQkFMQ8XDTI1MDcxMDE3MjMwNFowKwYLKoZIhvcNAQkQAgwxHDAaMBgwFgQU
-# 3WIwrIYKLTBr2jixaHlSMAf7QX4wLwYJKoZIhvcNAQkEMSIEIKvdr4Xrj+9v48U7
-# H25jqmSBw0McvZANHdNpqfby9e8sMDcGCyqGSIb3DQEJEAIvMSgwJjAkMCIEIEqg
-# P6Is11yExVyTj4KOZ2ucrsqzP+NtJpqjNPFGEQozMA0GCSqGSIb3DQEBAQUABIIC
-# AFOxOviO1dNy3kg0/jTIqlr829SRxjCadSGXqvUu3yN2KIsIYPDxbNDl3ZcFPjJ8
-# LdrYn20WecnGAhbu7DF7436zeZsB5SxGmUYy3Skgb7VWh7i58/5U6cFZRIHrekfb
-# GO68zw222W2NqzOKa7zpYBDzaw10gvWFRr4IMj1N7KBtsMTsfW2LrggYtNqZecpV
-# DQvybtc9TvLtls1qS92AAuYNeNyi9f+cNucAEnMX37/CD2E8x5mPvexd0Xq7BSO5
-# R/5c85Sua5VS6BX/l2MHq7ubxJ414w1sUpk2HzpfhgcxEVctYi3o6biXRN18Jq/9
-# lYbqAvZd5yCQMszEEOkNCkVEy7bdeow/EH7iAZFufkGHwMPKbElhti9/ViTKl4Uv
-# JtgSEUBc884W9MElK4IZCuJC/3c2WY1/DHSVWLwX1D8TV62Ry8dN9BP5kL7dwDiR
-# To2x+PHv5ad4E902iZkJPEQSE60euNsoFs74hWPoZvJ13bRs7vQB6glsOew8E1oE
-# iKGZ/89nZVctKODiARMhT1sLrfdzYajQcdks5pmgep//gSDOaiUuHtzKMslcYBHE
-# 9/pxqPxsqTApC3So4oHIWwEUbIDWrJdlKBGr+9FD9X1evEGpfaxCqoAupMrOSPNw
-# F3oQeJcoTh9pDd06njBiS302vdi6BMxrxcjVaSIZlkNH
-# SIG # End signature block

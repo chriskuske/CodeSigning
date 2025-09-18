@@ -51,9 +51,9 @@ This tool provides a streamlined interface for code signing PowerShell scripts, 
 
 - **Windows** with PowerShell 5.1 or higher (not cross-platform)
 - Access to an Azure Key Vault with a code signing certificate
-- AzureSignTool-x64.exe v6.0.1 (auto-downloaded if not present)
-- Cosign.exe v2.2.3 (auto-downloaded if needed for container signing)
-- Internet connectivity for tool download (first run only)
+- AzureSignTool-x64.exe v6.0.1 (auto-downloaded if not present; use -UpdateTools to force re-download)
+- Cosign.exe v2.2.3 (auto-downloaded if needed for container signing; use -UpdateTools to force re-download)
+- Internet connectivity for tool download (first run only or when -UpdateTools is used)
 - Appropriate permissions to Azure Key Vault
 - For Cosign: **Key must be ECDSA P-256** in Azure Key Vault
 
@@ -153,7 +153,19 @@ You can manage stored certificate names via the interactive menu:
 
 ## Updating Tools
 
-- To update AzureSignTool or Cosign, delete the respective `.exe` file in the script directory. The script will auto-download the latest supported version on next run.
+- To update AzureSignTool or Cosign you have two options:
+  - Delete the `AzureSignTool-x64.exe` or `cosign.exe` from the script directory and rerun the script (it will download again), or
+  - Rerun the script with the -UpdateTools switch: `. \CodeSignWrapper.ps1 -Path "<path>" -UpdateTools`
+- Note: By default the script reuses any existing executables in the script directory. This avoids repeated downloads in CI systems (for example, Jenkins) when the directory is static.
+
+## Credential Management and Export/Import
+
+- Credentials are stored in Windows Credential Manager using the `cmdkey` utility.
+- Important: Windows `cmdkey` does not expose stored secrets in plaintext. As a result:
+  - Get-CodeSigningCredential returns metadata (username) and explicitly indicates the secret is not retrievable.
+  - Export-CodeSigningCredentials writes metadata (CertificateName and Username) only — secrets are NOT exported.
+  - Import-CodeSigningCredentials accepts JSON items that may include a `Secret` field. If `Secret` is present it will be stored via Save-CodeSigningCredential (useful for migrating credentials). If `Secret` is omitted the import will create metadata only (no secret stored).
+- For secure credential migration/export, provide secrets explicitly only in secure transfer mechanisms; avoid storing plaintext secrets in repo files.
 
 ## CI/CD Integration
 
@@ -222,6 +234,7 @@ A: Run `CodeSignGui.ps1` and use the window to select and sign a file.
 - Added installer script for right-click context menu (no admin required)
 - Added simple GUI for file selection and signing
 - Documentation updates for new install and GUI features
+- Added -UpdateTools switch: existing tools are reused unless -UpdateTools is passed or the .exe is missing
 
 ### v1.3.0 (May 27, 2025)
 - Improved error handling and certificate validation
