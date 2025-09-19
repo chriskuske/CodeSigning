@@ -1,18 +1,18 @@
-Commit message:
-feat: add CHANGELOG and make tool-download deterministic; add -UpdateTools switch and credential-manager clarifications
+Commit: feat: avoid unnecessary tool downloads; add -UpdateTools; clarify credential behavior
 
-Summary:
-- Add CHANGELOG.md describing recent changes.
-- Make AzureSignTool/cosign download on-demand and respect -UpdateTools (avoid re-downloads when executables exist).
-- Clarify credential manager behavior (metadata-only exports) and return empty arrays when no credentials exist.
-- Include installer and GUI files. Update README.
-
-Files to stage:
+Files:
 - CodeSignWrapper.ps1
 - CredentialManager.ps1
 - README.md
 - Install-CodeSignWrapper.ps1
 - CodeSignGui.ps1
+- CHANGELOG.md
+- COMMIT_MESSAGE.txt
+
+Commands:
+git add CodeSignWrapper.ps1 CredentialManager.ps1 README.md Install-CodeSignWrapper.ps1 CodeSignGui.ps1 CHANGELOG.md COMMIT_MESSAGE.txt
+git commit -m "feat: avoid unnecessary tool downloads; add -UpdateTools; clarify credential behavior"
+git push origin <your-branch>
 - CHANGELOG.md
 - COMMIT_MESSAGE.txt
 

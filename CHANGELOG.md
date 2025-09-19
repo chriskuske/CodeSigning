@@ -3,6 +3,12 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased] - 2025-09-18
+- Fix: Avoid re-downloading AzureSignTool/cosign when executables already exist in script directory.
+- Add: New CLI switch `-UpdateTools` to force tool re-download when needed.
+- Clarify: CredentialManager returns metadata only (secrets not retrievable via cmdkey).
+- Docs: README updated to document -UpdateTools and tool behavior.
+
+## [Unreleased] - 2025-09-17
 ### Changed
 - Prevent unnecessary re-downloads of AzureSignTool/cosign when the executables already exist in the script directory.
 - Introduced a new CLI switch `-UpdateTools` to force re-download of AzureSignTool and cosign when required.
