@@ -57,8 +57,11 @@ $signBtn.Add_Click({
         [Windows.Forms.MessageBox]::Show("Invalid path.","Error","OK","Error") | Out-Null
         return
     }
-    $quotedPath = '"' + $path + '"'
-    Start-Process powershell -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File","`"$PSScriptRoot\CodeSignWrapper.ps1`"","-Path",$quotedPath -WindowStyle Normal
+    Start-Process powershell -ArgumentList @(
+        "-NoProfile","-ExecutionPolicy","Bypass",
+        "-File","$PSScriptRoot\CodeSignWrapper.ps1",
+        "-Path",$path
+    ) -WindowStyle Normal
     $form.Close()
 })
 $form.Controls.Add($signBtn)

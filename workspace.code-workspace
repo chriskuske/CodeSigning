@@ -1,4 +1,12 @@
 {
-	"folders": [],
-	"settings": {}
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.exclude": {
+			"**/logs": true
+		}
+	}
 }

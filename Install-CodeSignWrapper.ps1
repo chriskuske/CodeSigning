@@ -50,7 +50,7 @@ Windows Registry Editor Version 5.00
 # Import only if not present
 $regKeyFile = 'HKCU:\Software\Classes\*\shell\CodeSignWithAzure'
 if (-not (Test-Path $regKeyFile)) {
-    Start-Process reg.exe -ArgumentList "import `"$regPath`"" -Wait
+    Start-Process reg.exe -ArgumentList @("import","$regPath") -Wait
 } else {
     Write-Host "Context menu already present (skipping registry import)."
 }
