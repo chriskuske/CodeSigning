@@ -4,6 +4,7 @@ Add-Type -AssemblyName System.Drawing
 $form = New-Object Windows.Forms.Form
 $form.Text = "Azure Code Signer"
 $form.Size = '400,220'
+$form.StartPosition = 'CenterScreen'
 
 $label = New-Object Windows.Forms.Label
 $label.Text = "Select file or folder to sign:"
@@ -53,10 +54,11 @@ $signBtn.Width = 80
 $signBtn.Add_Click({
     $path = $textBox.Text
     if (-not (Test-Path $path)) {
-        [Windows.Forms.MessageBox]::Show("Invalid path.","Error","OK","Error")
+        [Windows.Forms.MessageBox]::Show("Invalid path.","Error","OK","Error") | Out-Null
         return
     }
-    Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSScriptRoot\CodeSignWrapper.ps1`" -Path `"$path`"" -WindowStyle Normal
+    $quotedPath = '"' + $path + '"'
+    Start-Process powershell -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File","`"$PSScriptRoot\CodeSignWrapper.ps1`"","-Path",$quotedPath -WindowStyle Normal
     $form.Close()
 })
 $form.Controls.Add($signBtn)

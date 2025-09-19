@@ -186,7 +186,7 @@ Begin {
         }
         catch {
             # Log error locally but don't fail the main operation
-            $errorMessage = "Failed to send to SIEM: $_"
+            $errorMessage = "Failed to send to SIEM: $($_.Exception.Message)"
             Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] $errorMessage"
             Write-Host $errorMessage -ForegroundColor Red
         }
@@ -363,7 +363,7 @@ See README.md for full documentation.
         }
         catch {
             # Log error locally but don't fail the main operation
-            $errorMessage = "Failed to send to SIEM: $_"
+            $errorMessage = "Failed to send to SIEM: $($_.Exception.Message)"
             Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] $errorMessage"
             Write-Host $errorMessage -ForegroundColor Red
         }
@@ -540,7 +540,7 @@ See README.md for full documentation.
         }
         catch {
             # Log error locally but don't fail the main operation
-            $errorMessage = "Failed to send to SIEM: $_"
+            $errorMessage = "Failed to send to SIEM: $($_.Exception.Message)"
             Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] $errorMessage"
             Write-Host $errorMessage -ForegroundColor Red
         }
@@ -717,7 +717,7 @@ See README.md for full documentation.
         }
         catch {
             # Log error locally but don't fail the main operation
-            $errorMessage = "Failed to send to SIEM: $_"
+            $errorMessage = "Failed to send to SIEM: $($_.Exception.Message)"
             Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] $errorMessage"
             Write-Host $errorMessage -ForegroundColor Red
         }
@@ -894,7 +894,7 @@ See README.md for full documentation.
         }
         catch {
             # Log error locally but don't fail the main operation
-            $errorMessage = "Failed to send to SIEM: $_"
+            $errorMessage = "Failed to send to SIEM: $($_.Exception.Message)"
             Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] $errorMessage"
             Write-Host $errorMessage -ForegroundColor Red
         }
@@ -1071,7 +1071,715 @@ See README.md for full documentation.
         }
         catch {
             # Log error locally but don't fail the main operation
-            $errorMessage = "Failed to send to SIEM: $_"
+            $errorMessage = "Failed to send to SIEM: $($_.Exception.Message)"
+            Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] $errorMessage"
+            Write-Host $errorMessage -ForegroundColor Red
+        }
+    }
+    
+    function Write-Log {
+        <#
+        .SYNOPSIS
+            Writes formatted log messages to both file and console, and SIEM if enabled
+        .DESCRIPTION
+            Handles logging of messages with timestamps and different severity levels,
+            writing to a log file, optionally to the console with color coding,
+            and to SIEM if enabled.
+        .PARAMETER Message
+            The message to log
+        .PARAMETER Level
+            The severity level (INFO, WARN, ERROR, SUCCESS)
+        .PARAMETER Console
+            Switch to indicate if message should also be written to console
+        .PARAMETER Properties
+            Additional properties to include in SIEM logs as a hashtable
+        #>
+        param(
+            [string]$Message,
+            [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS')]
+            [string]$Level = "INFO",
+            [switch]$Console,
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$SendToSIEM = $false
+        )
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $logMessage = "$timestamp [$Level] $Message"
+        
+        # Write to log file
+        Add-Content -Path $LogFile -Value $logMessage
+        
+        # Write to console if requested or for important messages
+        if ($Console -or $Level -in @('ERROR', 'SUCCESS') -or $VerbosePreference -eq 'Continue') {
+            $color = switch ($Level) {
+                'ERROR' { 'Red' }
+                'WARN'  { 'Yellow' }
+                'SUCCESS' { 'Green' }
+                default { 'Gray' }
+            }
+            Write-Host $logMessage -ForegroundColor $color
+        }
+        
+        # Only send to SIEM if explicitly requested now - we'll do a comprehensive send at the end
+        if ($SendToSIEM) {
+            Send-ToSIEM -Message $Message -Level $Level -EventType $EventType -Action $Action -Properties $Properties
+        }
+    }
+
+    if ($Help) {
+        Write-Host @"
+CodeSignWrapper.ps1 - Sign files and containers using Azure Key Vault certificates
+
+Usage:
+  .\CodeSignWrapper.ps1 -Path <file|directory> [options]
+
+Options:
+  -Include <patterns>         File patterns to include (default: *.ps1, *.exe, etc)
+  -Exclude <patterns>         File patterns to exclude
+  -CertificateName <name>     Use specific certificate
+  -RememberCertificate        Remember last used certificate
+  -Recurse                   Process directories recursively
+  -Force                     Force re-signing of already signed files
+  -UpdateTools               Force re-download of AzureSignTool/Cosign
+  -UseContainerSigning       Use Cosign for container signing
+  -Help                      Show this help message
+  -Version                   Show script and tool versions
+  -DryRun                    Show what would be signed, but do not sign
+
+See README.md for full documentation.
+"@
+        exit 0
+    }
+
+    if ($Version) {
+        Write-Host "CodeSignWrapper.ps1 version 1.4.0"
+        Write-Host "AzureSignTool: v6.0.1"
+        Write-Host "Cosign: v2.2.3"
+        exit 0
+    }
+
+    # Ensure script can find its dependencies regardless of where it's run from
+    $scriptPath = $MyInvocation.MyCommand.Path
+    $scriptDir = Split-Path -Parent $scriptPath
+    
+    # Update paths to be relative to script location
+    $ConfigPath = Join-Path $scriptDir "config.json"
+    $LogDir = Join-Path $scriptDir "logs"
+    $credentialManagerPath = Join-Path $scriptDir "CredentialManager.ps1"
+    $lastUsedCertPath = Join-Path $scriptDir "lastcert.txt"
+    
+    # Create directories if they don't exist
+    if (-not (Test-Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+    }
+
+    # Initialize log file with timestamp
+    $LogFile = Join-Path $LogDir ("signing_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+
+    # Enhanced SIEM logging for better visibility
+    function Send-ToSIEM {
+        param(
+            [string]$Message,
+            [string]$Level = "INFO",
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$ForceSend = $false
+        )
+        
+        # Only send to SIEM if explicitly forced or if EnableSIEM is true
+        # This allows us to collect logs but only send the final summary
+        if ((-not $EnableSIEM) -and (-not $ForceSend)) { return }
+        
+        try {
+            # Create a structured log event with Exabeam expected fields
+            $eventProperties = @{
+                # Standard Exabeam fields based on your screenshot
+                "activity" = $EventType
+                "activity_type" = "code-signing"  
+                "landscape" = "endpoint security"
+                # Improved mapping of log levels to outcomes
+                "outcome" = switch ($Level) {
+                    "SUCCESS" { "success" }
+                    "ERROR" { "failure" }
+                    "WARN" { "warning" }
+                    "INFO" { "informational" }
+                    default { "informational" }
+                }
+                "platform" = "Windows"
+                "product" = "CodeSignWrapper"
+                "product_category" = "security operation"
+                "subject" = $Action
+                "time" = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                "vendor" = "Teledyne"
+                "src_ip" = [string](Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne "127.0.0.1" } | Select-Object -First 1 -ExpandProperty IPAddress)
+                "user" = $env:USERNAME
+                "host" = $env:COMPUTERNAME
+                "Message" = $Message
+            }
+            
+            # Add any additional properties 
+            foreach ($key in $Properties.Keys) {
+                $eventProperties[$key] = $Properties[$key]
+            }
+            
+            # Convert to JSON for better parsing in SIEM
+            $jsonEvent = $eventProperties | ConvertTo-Json -Compress
+            
+            if ($SIEMProtocol -eq "TCP") {
+                $client = New-Object System.Net.Sockets.TcpClient
+                $client.Connect($SIEMServer, $SIEMPort)
+                $stream = $client.GetStream()
+                $writer = New-Object System.IO.StreamWriter($stream)
+                $writer.WriteLine($jsonEvent)
+                $writer.Flush()
+                $writer.Close()
+                $stream.Close()
+                $client.Close()
+            }
+            else { # UDP
+                $endpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($SIEMServer), $SIEMPort)
+                $udpClient = New-Object System.Net.Sockets.UdpClient
+                $bytes = [System.Text.Encoding]::ASCII.GetBytes($jsonEvent)
+                $udpClient.Send($bytes, $bytes.Length, $endpoint)
+                $udpClient.Close()
+            }
+        }
+        catch {
+            # Log error locally but don't fail the main operation
+            $errorMessage = "Failed to send to SIEM: $($_.Exception.Message)"
+            Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] $errorMessage"
+            Write-Host $errorMessage -ForegroundColor Red
+        }
+    }
+    
+    function Write-Log {
+        <#
+        .SYNOPSIS
+            Writes formatted log messages to both file and console, and SIEM if enabled
+        .DESCRIPTION
+            Handles logging of messages with timestamps and different severity levels,
+            writing to a log file, optionally to the console with color coding,
+            and to SIEM if enabled.
+        .PARAMETER Message
+            The message to log
+        .PARAMETER Level
+            The severity level (INFO, WARN, ERROR, SUCCESS)
+        .PARAMETER Console
+            Switch to indicate if message should also be written to console
+        .PARAMETER Properties
+            Additional properties to include in SIEM logs as a hashtable
+        #>
+        param(
+            [string]$Message,
+            [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS')]
+            [string]$Level = "INFO",
+            [switch]$Console,
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$SendToSIEM = $false
+        )
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $logMessage = "$timestamp [$Level] $Message"
+        
+        # Write to log file
+        Add-Content -Path $LogFile -Value $logMessage
+        
+        # Write to console if requested or for important messages
+        if ($Console -or $Level -in @('ERROR', 'SUCCESS') -or $VerbosePreference -eq 'Continue') {
+            $color = switch ($Level) {
+                'ERROR' { 'Red' }
+                'WARN'  { 'Yellow' }
+                'SUCCESS' { 'Green' }
+                default { 'Gray' }
+            }
+            Write-Host $logMessage -ForegroundColor $color
+        }
+        
+        # Only send to SIEM if explicitly requested now - we'll do a comprehensive send at the end
+        if ($SendToSIEM) {
+            Send-ToSIEM -Message $Message -Level $Level -EventType $EventType -Action $Action -Properties $Properties
+        }
+    }
+
+    if ($Help) {
+        Write-Host @"
+CodeSignWrapper.ps1 - Sign files and containers using Azure Key Vault certificates
+
+Usage:
+  .\CodeSignWrapper.ps1 -Path <file|directory> [options]
+
+Options:
+  -Include <patterns>         File patterns to include (default: *.ps1, *.exe, etc)
+  -Exclude <patterns>         File patterns to exclude
+  -CertificateName <name>     Use specific certificate
+  -RememberCertificate        Remember last used certificate
+  -Recurse                   Process directories recursively
+  -Force                     Force re-signing of already signed files
+  -UpdateTools               Force re-download of AzureSignTool/Cosign
+  -UseContainerSigning       Use Cosign for container signing
+  -Help                      Show this help message
+  -Version                   Show script and tool versions
+  -DryRun                    Show what would be signed, but do not sign
+
+See README.md for full documentation.
+"@
+        exit 0
+    }
+
+    if ($Version) {
+        Write-Host "CodeSignWrapper.ps1 version 1.4.0"
+        Write-Host "AzureSignTool: v6.0.1"
+        Write-Host "Cosign: v2.2.3"
+        exit 0
+    }
+
+    # Ensure script can find its dependencies regardless of where it's run from
+    $scriptPath = $MyInvocation.MyCommand.Path
+    $scriptDir = Split-Path -Parent $scriptPath
+    
+    # Update paths to be relative to script location
+    $ConfigPath = Join-Path $scriptDir "config.json"
+    $LogDir = Join-Path $scriptDir "logs"
+    $credentialManagerPath = Join-Path $scriptDir "CredentialManager.ps1"
+    $lastUsedCertPath = Join-Path $scriptDir "lastcert.txt"
+    
+    # Create directories if they don't exist
+    if (-not (Test-Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+    }
+
+    # Initialize log file with timestamp
+    $LogFile = Join-Path $LogDir ("signing_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+
+    # Enhanced SIEM logging for better visibility
+    function Send-ToSIEM {
+        param(
+            [string]$Message,
+            [string]$Level = "INFO",
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$ForceSend = $false
+        )
+        
+        # Only send to SIEM if explicitly forced or if EnableSIEM is true
+        # This allows us to collect logs but only send the final summary
+        if ((-not $EnableSIEM) -and (-not $ForceSend)) { return }
+        
+        try {
+            # Create a structured log event with Exabeam expected fields
+            $eventProperties = @{
+                # Standard Exabeam fields based on your screenshot
+                "activity" = $EventType
+                "activity_type" = "code-signing"  
+                "landscape" = "endpoint security"
+                # Improved mapping of log levels to outcomes
+                "outcome" = switch ($Level) {
+                    "SUCCESS" { "success" }
+                    "ERROR" { "failure" }
+                    "WARN" { "warning" }
+                    "INFO" { "informational" }
+                    default { "informational" }
+                }
+                "platform" = "Windows"
+                "product" = "CodeSignWrapper"
+                "product_category" = "security operation"
+                "subject" = $Action
+                "time" = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                "vendor" = "Teledyne"
+                "src_ip" = [string](Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne "127.0.0.1" } | Select-Object -First 1 -ExpandProperty IPAddress)
+                "user" = $env:USERNAME
+                "host" = $env:COMPUTERNAME
+                "Message" = $Message
+            }
+            
+            # Add any additional properties 
+            foreach ($key in $Properties.Keys) {
+                $eventProperties[$key] = $Properties[$key]
+            }
+            
+            # Convert to JSON for better parsing in SIEM
+            $jsonEvent = $eventProperties | ConvertTo-Json -Compress
+            
+            if ($SIEMProtocol -eq "TCP") {
+                $client = New-Object System.Net.Sockets.TcpClient
+                $client.Connect($SIEMServer, $SIEMPort)
+                $stream = $client.GetStream()
+                $writer = New-Object System.IO.StreamWriter($stream)
+                $writer.WriteLine($jsonEvent)
+                $writer.Flush()
+                $writer.Close()
+                $stream.Close()
+                $client.Close()
+            }
+            else { # UDP
+                $endpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($SIEMServer), $SIEMPort)
+                $udpClient = New-Object System.Net.Sockets.UdpClient
+                $bytes = [System.Text.Encoding]::ASCII.GetBytes($jsonEvent)
+                $udpClient.Send($bytes, $bytes.Length, $endpoint)
+                $udpClient.Close()
+            }
+        }
+        catch {
+            # Log error locally but don't fail the main operation
+            $errorMessage = "Failed to send to SIEM: $($_.Exception.Message)"
+            Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] $errorMessage"
+            Write-Host $errorMessage -ForegroundColor Red
+        }
+    }
+    
+    function Write-Log {
+        <#
+        .SYNOPSIS
+            Writes formatted log messages to both file and console, and SIEM if enabled
+        .DESCRIPTION
+            Handles logging of messages with timestamps and different severity levels,
+            writing to a log file, optionally to the console with color coding,
+            and to SIEM if enabled.
+        .PARAMETER Message
+            The message to log
+        .PARAMETER Level
+            The severity level (INFO, WARN, ERROR, SUCCESS)
+        .PARAMETER Console
+            Switch to indicate if message should also be written to console
+        .PARAMETER Properties
+            Additional properties to include in SIEM logs as a hashtable
+        #>
+        param(
+            [string]$Message,
+            [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS')]
+            [string]$Level = "INFO",
+            [switch]$Console,
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$SendToSIEM = $false
+        )
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $logMessage = "$timestamp [$Level] $Message"
+        
+        # Write to log file
+        Add-Content -Path $LogFile -Value $logMessage
+        
+        # Write to console if requested or for important messages
+        if ($Console -or $Level -in @('ERROR', 'SUCCESS') -or $VerbosePreference -eq 'Continue') {
+            $color = switch ($Level) {
+                'ERROR' { 'Red' }
+                'WARN'  { 'Yellow' }
+                'SUCCESS' { 'Green' }
+                default { 'Gray' }
+            }
+            Write-Host $logMessage -ForegroundColor $color
+        }
+        
+        # Only send to SIEM if explicitly requested now - we'll do a comprehensive send at the end
+        if ($SendToSIEM) {
+            Send-ToSIEM -Message $Message -Level $Level -EventType $EventType -Action $Action -Properties $Properties
+        }
+    }
+
+    if ($Help) {
+        Write-Host @"
+CodeSignWrapper.ps1 - Sign files and containers using Azure Key Vault certificates
+
+Usage:
+  .\CodeSignWrapper.ps1 -Path <file|directory> [options]
+
+Options:
+  -Include <patterns>         File patterns to include (default: *.ps1, *.exe, etc)
+  -Exclude <patterns>         File patterns to exclude
+  -CertificateName <name>     Use specific certificate
+  -RememberCertificate        Remember last used certificate
+  -Recurse                   Process directories recursively
+  -Force                     Force re-signing of already signed files
+  -UpdateTools               Force re-download of AzureSignTool/Cosign
+  -UseContainerSigning       Use Cosign for container signing
+  -Help                      Show this help message
+  -Version                   Show script and tool versions
+  -DryRun                    Show what would be signed, but do not sign
+
+See README.md for full documentation.
+"@
+        exit 0
+    }
+
+    if ($Version) {
+        Write-Host "CodeSignWrapper.ps1 version 1.4.0"
+        Write-Host "AzureSignTool: v6.0.1"
+        Write-Host "Cosign: v2.2.3"
+        exit 0
+    }
+
+    # Ensure script can find its dependencies regardless of where it's run from
+    $scriptPath = $MyInvocation.MyCommand.Path
+    $scriptDir = Split-Path -Parent $scriptPath
+    
+    # Update paths to be relative to script location
+    $ConfigPath = Join-Path $scriptDir "config.json"
+    $LogDir = Join-Path $scriptDir "logs"
+    $credentialManagerPath = Join-Path $scriptDir "CredentialManager.ps1"
+    $lastUsedCertPath = Join-Path $scriptDir "lastcert.txt"
+    
+    # Create directories if they don't exist
+    if (-not (Test-Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+    }
+
+    # Initialize log file with timestamp
+    $LogFile = Join-Path $LogDir ("signing_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+
+    # Enhanced SIEM logging for better visibility
+    function Send-ToSIEM {
+        param(
+            [string]$Message,
+            [string]$Level = "INFO",
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$ForceSend = $false
+        )
+        
+        # Only send to SIEM if explicitly forced or if EnableSIEM is true
+        # This allows us to collect logs but only send the final summary
+        if ((-not $EnableSIEM) -and (-not $ForceSend)) { return }
+        
+        try {
+            # Create a structured log event with Exabeam expected fields
+            $eventProperties = @{
+                # Standard Exabeam fields based on your screenshot
+                "activity" = $EventType
+                "activity_type" = "code-signing"  
+                "landscape" = "endpoint security"
+                # Improved mapping of log levels to outcomes
+                "outcome" = switch ($Level) {
+                    "SUCCESS" { "success" }
+                    "ERROR" { "failure" }
+                    "WARN" { "warning" }
+                    "INFO" { "informational" }
+                    default { "informational" }
+                }
+                "platform" = "Windows"
+                "product" = "CodeSignWrapper"
+                "product_category" = "security operation"
+                "subject" = $Action
+                "time" = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                "vendor" = "Teledyne"
+                "src_ip" = [string](Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne "127.0.0.1" } | Select-Object -First 1 -ExpandProperty IPAddress)
+                "user" = $env:USERNAME
+                "host" = $env:COMPUTERNAME
+                "Message" = $Message
+            }
+            
+            # Add any additional properties 
+            foreach ($key in $Properties.Keys) {
+                $eventProperties[$key] = $Properties[$key]
+            }
+            
+            # Convert to JSON for better parsing in SIEM
+            $jsonEvent = $eventProperties | ConvertTo-Json -Compress
+            
+            if ($SIEMProtocol -eq "TCP") {
+                $client = New-Object System.Net.Sockets.TcpClient
+                $client.Connect($SIEMServer, $SIEMPort)
+                $stream = $client.GetStream()
+                $writer = New-Object System.IO.StreamWriter($stream)
+                $writer.WriteLine($jsonEvent)
+                $writer.Flush()
+                $writer.Close()
+                $stream.Close()
+                $client.Close()
+            }
+            else { # UDP
+                $endpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($SIEMServer), $SIEMPort)
+                $udpClient = New-Object System.Net.Sockets.UdpClient
+                $bytes = [System.Text.Encoding]::ASCII.GetBytes($jsonEvent)
+                $udpClient.Send($bytes, $bytes.Length, $endpoint)
+                $udpClient.Close()
+            }
+        }
+        catch {
+            # Log error locally but don't fail the main operation
+            $errorMessage = "Failed to send to SIEM: $($_.Exception.Message)"
+            Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] $errorMessage"
+            Write-Host $errorMessage -ForegroundColor Red
+        }
+    }
+    
+    function Write-Log {
+        <#
+        .SYNOPSIS
+            Writes formatted log messages to both file and console, and SIEM if enabled
+        .DESCRIPTION
+            Handles logging of messages with timestamps and different severity levels,
+            writing to a log file, optionally to the console with color coding,
+            and to SIEM if enabled.
+        .PARAMETER Message
+            The message to log
+        .PARAMETER Level
+            The severity level (INFO, WARN, ERROR, SUCCESS)
+        .PARAMETER Console
+            Switch to indicate if message should also be written to console
+        .PARAMETER Properties
+            Additional properties to include in SIEM logs as a hashtable
+        #>
+        param(
+            [string]$Message,
+            [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS')]
+            [string]$Level = "INFO",
+            [switch]$Console,
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$SendToSIEM = $false
+        )
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $logMessage = "$timestamp [$Level] $Message"
+        
+        # Write to log file
+        Add-Content -Path $LogFile -Value $logMessage
+        
+        # Write to console if requested or for important messages
+        if ($Console -or $Level -in @('ERROR', 'SUCCESS') -or $VerbosePreference -eq 'Continue') {
+            $color = switch ($Level) {
+                'ERROR' { 'Red' }
+                'WARN'  { 'Yellow' }
+                'SUCCESS' { 'Green' }
+                default { 'Gray' }
+            }
+            Write-Host $logMessage -ForegroundColor $color
+        }
+        
+        # Only send to SIEM if explicitly requested now - we'll do a comprehensive send at the end
+        if ($SendToSIEM) {
+            Send-ToSIEM -Message $Message -Level $Level -EventType $EventType -Action $Action -Properties $Properties
+        }
+    }
+
+    if ($Help) {
+        Write-Host @"
+CodeSignWrapper.ps1 - Sign files and containers using Azure Key Vault certificates
+
+Usage:
+  .\CodeSignWrapper.ps1 -Path <file|directory> [options]
+
+Options:
+  -Include <patterns>         File patterns to include (default: *.ps1, *.exe, etc)
+  -Exclude <patterns>         File patterns to exclude
+  -CertificateName <name>     Use specific certificate
+  -RememberCertificate        Remember last used certificate
+  -Recurse                   Process directories recursively
+  -Force                     Force re-signing of already signed files
+  -UpdateTools               Force re-download of AzureSignTool/Cosign
+  -UseContainerSigning       Use Cosign for container signing
+  -Help                      Show this help message
+  -Version                   Show script and tool versions
+  -DryRun                    Show what would be signed, but do not sign
+
+See README.md for full documentation.
+"@
+        exit 0
+    }
+
+    if ($Version) {
+        Write-Host "CodeSignWrapper.ps1 version 1.4.0"
+        Write-Host "AzureSignTool: v6.0.1"
+        Write-Host "Cosign: v2.2.3"
+        exit 0
+    }
+
+    # Ensure script can find its dependencies regardless of where it's run from
+    $scriptPath = $MyInvocation.MyCommand.Path
+    $scriptDir = Split-Path -Parent $scriptPath
+    
+    # Update paths to be relative to script location
+    $ConfigPath = Join-Path $scriptDir "config.json"
+    $LogDir = Join-Path $scriptDir "logs"
+    $credentialManagerPath = Join-Path $scriptDir "CredentialManager.ps1"
+    $lastUsedCertPath = Join-Path $scriptDir "lastcert.txt"
+    
+    # Create directories if they don't exist
+    if (-not (Test-Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+    }
+
+    # Initialize log file with timestamp
+    $LogFile = Join-Path $LogDir ("signing_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+
+    # Enhanced SIEM logging for better visibility
+    function Send-ToSIEM {
+        param(
+            [string]$Message,
+            [string]$Level = "INFO",
+            [string]$EventType = "CodeSigning",
+            [string]$Action = "",
+            [hashtable]$Properties = @{ },
+            [switch]$ForceSend = $false
+        )
+        
+        # Only send to SIEM if explicitly forced or if EnableSIEM is true
+        # This allows us to collect logs but only send the final summary
+        if ((-not $EnableSIEM) -and (-not $ForceSend)) { return }
+        
+        try {
+            # Create a structured log event with Exabeam expected fields
+            $eventProperties = @{
+                # Standard Exabeam fields based on your screenshot
+                "activity" = $EventType
+                "activity_type" = "code-signing"  
+                "landscape" = "endpoint security"
+                # Improved mapping of log levels to outcomes
+                "outcome" = switch ($Level) {
+                    "SUCCESS" { "success" }
+                    "ERROR" { "failure" }
+                    "WARN" { "warning" }
+                    "INFO" { "informational" }
+                    default { "informational" }
+                }
+                "platform" = "Windows"
+                "product" = "CodeSignWrapper"
+                "product_category" = "security operation"
+                "subject" = $Action
+                "time" = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                "vendor" = "Teledyne"
+                "src_ip" = [string](Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne "127.0.0.1" } | Select-Object -First 1 -ExpandProperty IPAddress)
+                "user" = $env:USERNAME
+                "host" = $env:COMPUTERNAME
+                "Message" = $Message
+            }
+            
+            # Add any additional properties 
+            foreach ($key in $Properties.Keys) {
+                $eventProperties[$key] = $Properties[$key]
+            }
+            
+            # Convert to JSON for better parsing in SIEM
+            $jsonEvent = $eventProperties | ConvertTo-Json -Compress
+            
+            if ($SIEMProtocol -eq "TCP") {
+                $client = New-Object System.Net.Sockets.TcpClient
+                $client.Connect($SIEMServer, $SIEMPort)
+                $stream = $client.GetStream()
+                $writer = New-Object System.IO.StreamWriter($stream)
+                $writer.WriteLine($jsonEvent)
+                $writer.Flush()
+                $writer.Close()
+                $stream.Close()
+                $client.Close()
+            }
+            else { # UDP
+                $endpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($SIEMServer), $SIEMPort)
+                $udpClient = New-Object System.Net.Sockets.UdpClient
+                $bytes = [System.Text.Encoding]::ASCII.GetBytes($jsonEvent)
+                $udpClient.Send($bytes, $bytes.Length, $endpoint)
+                $udpClient.Close()
+            }
+        }
+        catch {
+            # Log error locally but don't fail the main operation
+            $errorMessage = "Failed to send to SIEM: $($_.Exception.Message)"
             Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [ERROR] $errorMessage"
             Write-Host $errorMessage -ForegroundColor Red
         }
@@ -1230,7 +1938,7 @@ See README.md for full documentation.
         #>
         $toolPath = Join-Path $scriptDir "AzureSignTool-x64.exe"
         # If tool already exists and user did not request tool update, reuse it
-        if (Test-Path $toolPath -and -not $UpdateTools) {
+        if ((Test-Path -Path $toolPath) -and (-not $UpdateTools)) {
             Write-Log "Azure Sign Tool found at $toolPath, not downloading." -Console
             return $toolPath
         }
@@ -1274,7 +1982,7 @@ See README.md for full documentation.
         #>
         $toolPath = Join-Path $scriptDir "cosign.exe"
         # If cosign already exists and user did not request tool update, reuse it
-        if (Test-Path $toolPath -and -not $UpdateTools) {
+        if ((Test-Path -Path $toolPath) -and (-not $UpdateTools)) {
             Write-Log "Cosign found at $toolPath, not downloading." -Console
             return $toolPath
         }
@@ -1412,7 +2120,7 @@ See README.md for full documentation.
                 "FileName" = (Split-Path $FilePath -Leaf)
                 "ErrorMessage" = $_.Exception.Message
             }
-            Write-Log "Error checking file $FilePath : $_" -Level ERROR -Properties $errorMetadata
+            Write-Log "Error checking file $FilePath : $($_.Exception.Message)" -Level ERROR -Properties $errorMetadata
             return $false
         }
     }
@@ -1757,33 +2465,44 @@ Process {
         $filesToSign = @()
         $containersToSign = @()
 
-        # New: Support direct file input for signing
         if (Test-Path $Path -PathType Leaf) {
-            # Single file provided, add to signing list
             if (Test-FileSignable -FilePath $Path) {
-                $filesToSign += $Path
+                $filesToSign += (Get-Item -LiteralPath $Path)
+            } else {
+                $stats.Skipped++
             }
         }
         else {
-            # Directory or wildcard path, collect matching files
             $searchPath = if ($Recurse) { "$Path\*" } else { $Path }
-            $filesToSign = Get-ChildItem -Path $searchPath -Include $Include -Exclude $Exclude -Recurse:$Recurse -File -ErrorAction SilentlyContinue
-
-            # Filter files based on signable criteria
-            $filesToSign = $filesToSign | Where-Object { Test-FileSignable -FilePath $_.FullName }
+            $rawFiles = Get-ChildItem -Path $searchPath -Include $Include -Exclude $Exclude -Recurse:$Recurse -File -ErrorAction SilentlyContinue
+            foreach ($f in $rawFiles) {
+                if (Test-FileSignable -FilePath $f.FullName) {
+                    $filesToSign += $f
+                } else {
+                    $stats.Skipped++
+                }
+            }
         }
 
-        # Log and exit if no files found to sign
         if ($filesToSign.Count -eq 0) {
             Write-Log "No files found to sign in the specified path: $Path" -Level WARN -Console
-            exit 0
+            return
         }
 
-        # Sign each file
+        # Set Total once (attemptable files). Already-signed filtered ones counted as Skipped earlier.
+        $stats.Total = $filesToSign.Count
+
+        if ($DryRun) {
+            Write-Log "DryRun enabled. Files that WOULD be signed:" -Level INFO -Console
+            $filesToSign | ForEach-Object { Write-Log "  $_" -Level INFO -Console }
+            Write-Log "DryRun summary: TotalCandidates=$($stats.Total) Skipped=$($stats.Skipped) Signed=0 Failed=0" -Level INFO -Console
+            return
+        }
+
         foreach ($file in $filesToSign) {
             try {
                 $filePath = $file.FullName
-                Write-Log "Signing file: $filePath" -Console
+                Write-Log "Signing file: ${filePath}" -Console
 
                 # Prepare arguments for AzureSignTool
                 $signArgs = @(
@@ -1801,27 +2520,25 @@ Process {
 
                 # Execute signing process
                 $processResult = Start-Process -FilePath $azureSignToolPath -ArgumentList $signArgs -NoNewWindow -Wait -PassThru
-
-                # Check exit code and log result
                 if ($processResult.ExitCode -eq 0) {
-                    Write-Log "Successfully signed: $filePath" -Level SUCCESS -Console
+                    Write-Log "Successfully signed: ${filePath}" -Level SUCCESS -Console
                     $stats.Success++
-                }
-                else {
-                    Write-Log "Failed to sign (exit code $($processResult.ExitCode)): $filePath" -Level ERROR -Console
+                } else {
+                    Write-Log "Failed to sign (exit code $($processResult.ExitCode)): ${filePath}" -Level ERROR -Console
                     $stats.Failed++
                 }
             }
             catch {
-                Write-Log "Error signing file $filePath: $_" -Level ERROR -Console
+                $errMsg = if ($_.Exception) { $_.Exception.Message } else { $_.ToString() }
+                Write-Log "Error signing file ${filePath}: $errMsg" -Level ERROR -Console -Properties @{ Exception = $errMsg }
                 $stats.Failed++
             }
         }
 
-        # Final statistics log
         Write-Log "Signing process completed. Total: $($stats.Total), Success: $($stats.Success), Failed: $($stats.Failed), Skipped: $($stats.Skipped)" -Level INFO -Console
     }
     catch {
-        Write-Log "Unexpected error: $_" -Level ERROR -Console
+        $msg = if ($_.Exception) { $_.Exception.Message } else { $_.ToString() }
+        Write-Log "Unexpected error in signing process: $msg" -Level ERROR -Console -Properties @{ Exception = $msg }
     }
 }

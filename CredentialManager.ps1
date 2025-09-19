@@ -78,6 +78,7 @@ function Save-CodeSigningCredential {
         if ($BSTR) {
             [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
         }
+        if ($plainText) { Remove-Variable plainText -ErrorAction SilentlyContinue }
     }
 }
 

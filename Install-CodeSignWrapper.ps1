@@ -47,7 +47,13 @@ Windows Registry Editor Version 5.00
 # & "$TargetDir\CodeSignWrapper.ps1" -Path $regPath
 
 # Import the .reg file for current user (no elevation needed)
-Start-Process reg.exe -ArgumentList "import `"$regPath`"" -Wait
+# Import only if not present
+$regKeyFile = 'HKCU:\Software\Classes\*\shell\CodeSignWithAzure'
+if (-not (Test-Path $regKeyFile)) {
+    Start-Process reg.exe -ArgumentList "import `"$regPath`"" -Wait
+} else {
+    Write-Host "Context menu already present (skipping registry import)."
+}
 
 Write-Host "CodeSignWrapper installed to $TargetDir"
 Write-Host "Right-click any file or folder to sign with Azure Key Vault."
