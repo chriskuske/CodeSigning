@@ -89,6 +89,46 @@ param(
     [switch]$DryRun
 )
 
+function Show-ErrorLogSummary {
+    <#
+    .SYNOPSIS
+        Shows a summary of any error log files created during the signing process
+    .DESCRIPTION
+        Checks for recent error log files in the log directory and displays information
+        about where to find detailed error information if signing failures occurred
+    #>
+    
+    # Check for recent error log files (within last 5 minutes)
+    $cutoffTime = (Get-Date).AddMinutes(-5)
+    $recentErrorLogs = Get-ChildItem -Path $LogDir -Filter "*_error_*.txt" -ErrorAction SilentlyContinue | 
+                       Where-Object { $_.LastWriteTime -ge $cutoffTime } | 
+                       Sort-Object LastWriteTime -Descending
+    
+    if ($recentErrorLogs) {
+        Write-Host "`n" + ("=" * 60) -ForegroundColor Red
+        Write-Host "ERROR LOG SUMMARY" -ForegroundColor Red
+        Write-Host ("=" * 60) -ForegroundColor Red
+        Write-Host "The following error logs were generated during this signing operation:" -ForegroundColor Yellow
+        Write-Host ""
+        
+        foreach ($logFile in $recentErrorLogs) {
+            Write-Host "  • $($logFile.Name)" -ForegroundColor White
+            Write-Host "    Created: $($logFile.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor Gray
+            Write-Host "    Size: $([math]::Round($logFile.Length / 1KB, 2)) KB" -ForegroundColor Gray
+            Write-Host "    Path: $($logFile.FullName)" -ForegroundColor Gray
+            Write-Host ""
+        }
+        
+        Write-Host "These files contain detailed error information including:" -ForegroundColor Yellow
+        Write-Host "  • Complete command-line arguments used" -ForegroundColor Gray
+        Write-Host "  • Full standard output and error streams" -ForegroundColor Gray
+        Write-Host "  • Exit codes and timestamps" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "Please review these files for detailed troubleshooting information." -ForegroundColor Yellow
+        Write-Host ("=" * 60) -ForegroundColor Red
+    }
+}
+
 Begin {
     $ErrorActionPreference = "Stop"
     Set-StrictMode -Version Latest
@@ -953,20 +993,49 @@ See README.md for full documentation.
         "--quiet"
     )
 
-    $null = Start-Process -FilePath $azureSignToolPath -ArgumentList $testArgs -NoNewWindow -Wait -PassThru -RedirectStandardError "$LogDir\stderr.txt"
+    $configTestResult = Start-Process -FilePath $azureSignToolPath -ArgumentList $testArgs -NoNewWindow -Wait -PassThru -RedirectStandardError "$LogDir\stderr.txt" -RedirectStandardOutput "$LogDir\stdout.txt"
+    
+    # Read both output streams before cleanup
+    $configStdout = $null
+    $configStderr = $null
+    
+    if (Test-Path "$LogDir\stdout.txt") {
+        $configStdout = Get-Content "$LogDir\stdout.txt" -Raw
+        Remove-Item "$LogDir\stdout.txt" -ErrorAction SilentlyContinue
+    }
+    
     if (Test-Path "$LogDir\stderr.txt") {
-        $errorContent = Get-Content "$LogDir\stderr.txt"
-        if ($errorContent) {
-            $configErrorData = @{
-                "KeyVaultUrl" = $config.KeyVaultUrl
-                "CertificateName" = $CertificateName
-                "ErrorDetails" = $errorContent -join "`n"
-            }
-            Write-Log -Message "Configuration validation failed" -Level ERROR -Console -EventType "CodeSigning" -Action "ConfigValidationFailed" -Properties $configErrorData
-            Write-Log -Message $errorContent -Level ERROR -Console -EventType "CodeSigning" -Action "ConfigValidationFailed" -Properties $configErrorData
-            exit 1
+        $configStderr = Get-Content "$LogDir\stderr.txt" -Raw
+        Remove-Item "$LogDir\stderr.txt" -ErrorAction SilentlyContinue
+    }
+    
+    if ($configTestResult.ExitCode -ne 0 -or $configStderr) {
+        Write-Host "Configuration validation failed!" -ForegroundColor Red
+        Write-Host "Exit Code: $($configTestResult.ExitCode)" -ForegroundColor Red
+        
+        if ($configStderr) {
+            Write-Host "Error Output:" -ForegroundColor Red
+            Write-Host $configStderr -ForegroundColor Red
         }
-        Remove-Item "$LogDir\stderr.txt"
+        
+        if ($configStdout) {
+            Write-Host "Standard Output:" -ForegroundColor Yellow  
+            Write-Host $configStdout -ForegroundColor Yellow
+        }
+        
+        $configErrorData = @{
+            "KeyVaultUrl" = $config.KeyVaultUrl
+            "CertificateName" = $CertificateName
+            "ExitCode" = $configTestResult.ExitCode
+            "ErrorDetails" = $configStderr
+            "StandardOutput" = $configStdout
+        }
+        
+        Write-Log -Message "Configuration validation failed with exit code $($configTestResult.ExitCode)" -Level ERROR -Console -EventType "CodeSigning" -Action "ConfigValidationFailed" -Properties $configErrorData
+        if ($configStderr) {
+            Write-Log -Message "Error details: $configStderr" -Level ERROR -Console -EventType "CodeSigning" -Action "ConfigValidationFailed" -Properties $configErrorData
+        }
+        exit 1
     }
     
     $configSuccessData = @{
@@ -1020,18 +1089,40 @@ Process {
                 -RedirectStandardError "$LogDir\stderr.txt" `
                 -RedirectStandardOutput "$LogDir\stdout.txt"
 
-            # Clean up temp files
-            Remove-Item "$LogDir\stdout.txt" -ErrorAction SilentlyContinue
+            # Read output files before cleanup
+            $stdoutContent = $null
+            $stderrContent = $null
+            
+            if (Test-Path "$LogDir\stdout.txt") {
+                $stdoutContent = Get-Content "$LogDir\stdout.txt" -Raw
+                Remove-Item "$LogDir\stdout.txt" -ErrorAction SilentlyContinue
+            }
+            
             if (Test-Path "$LogDir\stderr.txt") {
-                $errorContent = Get-Content "$LogDir\stderr.txt"
-                Remove-Item "$LogDir\stderr.txt"
-                if ($errorContent) {
-                    throw "Validation failed: $errorContent"
-                }
+                $stderrContent = Get-Content "$LogDir\stderr.txt" -Raw
+                Remove-Item "$LogDir\stderr.txt" -ErrorAction SilentlyContinue
             }
             
             if ($testResult.ExitCode -ne 0) {
-                throw "AzureSignTool validation failed with exit code: $($testResult.ExitCode)"
+                # Display detailed validation error information
+                Write-Host "Certificate validation failed with exit code: $($testResult.ExitCode)" -ForegroundColor Red
+                
+                if ($stderrContent) {
+                    Write-Host "Error Output:" -ForegroundColor Red
+                    Write-Host $stderrContent -ForegroundColor Red
+                }
+                
+                if ($stdoutContent) {
+                    Write-Host "Standard Output:" -ForegroundColor Yellow
+                    Write-Host $stdoutContent -ForegroundColor Yellow
+                }
+                
+                $errorMessage = "AzureSignTool validation failed with exit code: $($testResult.ExitCode)"
+                if ($stderrContent) {
+                    $errorMessage += ". Error: $stderrContent"
+                }
+                
+                throw $errorMessage
             }
             
             Write-Log "Azure Sign Tool validation successful" -Level SUCCESS -Console
@@ -1125,6 +1216,7 @@ Process {
                             $processStartInfo.FileName = $cosignPath
                             $processStartInfo.Arguments = $signArgs -join ' '
                             $processStartInfo.RedirectStandardError = $true
+                            $processStartInfo.RedirectStandardOutput = $true
                             $processStartInfo.UseShellExecute = $false
                             $processStartInfo.CreateNoWindow = $true
                             
@@ -1132,12 +1224,47 @@ Process {
                             $process.StartInfo = $processStartInfo
                             [void]$process.Start()
                             $stderr = $process.StandardError.ReadToEnd()
+                            $stdout = $process.StandardOutput.ReadToEnd()
                             $process.WaitForExit()
                             
                             # Check for errors
-                            if ($process.ExitCode -ne 0) { 
-                                $stderr | Out-File "$LogDir\stderr.txt"
-                                throw "Container signing failed with exit code $($process.ExitCode). Details: $stderr"
+                            if ($process.ExitCode -ne 0) {
+                                # Log error details for debugging
+                                $cosignErrorFile = "$LogDir\cosign_error_$([DateTime]::Now.ToString('yyyyMMdd_HHmmss')).txt"
+                                $cosignErrorOutput = @()
+                                $cosignErrorOutput += "=== Cosign Error Details ==="
+                                $cosignErrorOutput += "Exit Code: $($process.ExitCode)"
+                                $cosignErrorOutput += "Container: $containerRef"
+                                $cosignErrorOutput += "Command: $($processStartInfo.FileName) $($processStartInfo.Arguments)"
+                                $cosignErrorOutput += "Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                                $cosignErrorOutput += ""
+                                if ($stdout) {
+                                    $cosignErrorOutput += "=== Standard Output ==="
+                                    $cosignErrorOutput += $stdout
+                                    $cosignErrorOutput += ""
+                                }
+                                if ($stderr) {
+                                    $cosignErrorOutput += "=== Standard Error ==="
+                                    $cosignErrorOutput += $stderr
+                                    $cosignErrorOutput += ""
+                                }
+                                
+                                $cosignErrorOutput | Out-File $cosignErrorFile -Encoding UTF8
+                                
+                                # Display error details to console
+                                Write-Host "Cosign Error Details:" -ForegroundColor Red
+                                Write-Host "Exit Code: $($process.ExitCode)" -ForegroundColor Red
+                                if ($stderr) {
+                                    Write-Host "Error Output:" -ForegroundColor Red
+                                    Write-Host $stderr -ForegroundColor Red
+                                }
+                                if ($stdout) {
+                                    Write-Host "Standard Output:" -ForegroundColor Yellow
+                                    Write-Host $stdout -ForegroundColor Yellow
+                                }
+                                Write-Host "Full error details saved to: $cosignErrorFile" -ForegroundColor Yellow
+                                
+                                throw "Cosign container signing failed with exit code $($process.ExitCode). See error details above or check $cosignErrorFile for complete information."
                             }
                             
                             # Log successful signing
@@ -1224,6 +1351,7 @@ Process {
                     $processStartInfo.FileName = $azureSignToolPath
                     $processStartInfo.Arguments = "$($signArgs -join ' ') `"$($file.FullName)`""
                     $processStartInfo.RedirectStandardError = $true
+                    $processStartInfo.RedirectStandardOutput = $true
                     $processStartInfo.UseShellExecute = $false
                     $processStartInfo.CreateNoWindow = $true
                     
@@ -1231,11 +1359,47 @@ Process {
                     $process.StartInfo = $processStartInfo
                     [void]$process.Start()
                     $stderr = $process.StandardError.ReadToEnd()
+                    $stdout = $process.StandardOutput.ReadToEnd()
                     $process.WaitForExit()
                     
                     if ($process.ExitCode -ne 0) { 
-                        $stderr | Out-File "$LogDir\stderr.txt"
-                        throw "Signing failed with exit code $($process.ExitCode). Details: $stderr"
+                        # Log both stdout and stderr for debugging
+                        $errorLogFile = "$LogDir\signing_error_$([DateTime]::Now.ToString('yyyyMMdd_HHmmss')).txt"
+                        $errorOutput = @()
+                        $errorOutput += "=== AzureSignTool Error Details ==="
+                        $errorOutput += "Exit Code: $($process.ExitCode)"
+                        $errorOutput += "File: $($file.FullName)"
+                        $errorOutput += "Command: $($processStartInfo.FileName) $($processStartInfo.Arguments)"
+                        $errorOutput += "Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                        $errorOutput += ""
+                        if ($stdout) {
+                            $errorOutput += "=== Standard Output ==="
+                            $errorOutput += $stdout
+                            $errorOutput += ""
+                        }
+                        if ($stderr) {
+                            $errorOutput += "=== Standard Error ==="
+                            $errorOutput += $stderr
+                            $errorOutput += ""
+                        }
+                        
+                        # Write to error log file
+                        $errorOutput | Out-File $errorLogFile -Encoding UTF8
+                        
+                        # Display error details to console
+                        Write-Host "AzureSignTool Error Details:" -ForegroundColor Red
+                        Write-Host "Exit Code: $($process.ExitCode)" -ForegroundColor Red
+                        if ($stderr) {
+                            Write-Host "Error Output:" -ForegroundColor Red
+                            Write-Host $stderr -ForegroundColor Red
+                        }
+                        if ($stdout) {
+                            Write-Host "Standard Output:" -ForegroundColor Yellow
+                            Write-Host $stdout -ForegroundColor Yellow
+                        }
+                        Write-Host "Full error details saved to: $errorLogFile" -ForegroundColor Yellow
+                        
+                        throw "AzureSignTool signing failed with exit code $($process.ExitCode). See error details above or check $errorLogFile for complete information."
                     }
                     
                     # Enhanced signature verification with structured SIEM logging
@@ -1285,15 +1449,31 @@ Process {
                     "FilePath" = $file.FullName
                     "FileName" = $file.Name
                     "ErrorMessage" = $_.ToString()
+                    "ExceptionType" = $_.Exception.GetType().Name
                 }
                 
                 Write-Log "Failed to sign $($file.Name)" -Level ERROR -Console
-                Write-Log "Error details: $_" -Level ERROR -Console
-                if (Test-Path "$LogDir\stderr.txt") {
-                    $toolOutput = Get-Content "$LogDir\stderr.txt" -Raw
-                    Write-Log "Tool output: $toolOutput" -Level ERROR -Console
-                    $errorDetails["ToolOutput"] = $toolOutput
+                Write-Log "Error Type: $($_.Exception.GetType().Name)" -Level ERROR -Console
+                Write-Log "Error Message: $($_.Exception.Message)" -Level ERROR -Console
+                
+                # Display inner exception details if available
+                if ($_.Exception.InnerException) {
+                    Write-Log "Inner Exception: $($_.Exception.InnerException.Message)" -Level ERROR -Console
+                    $errorDetails["InnerException"] = $_.Exception.InnerException.Message
                 }
+                
+                # Display stack trace in verbose mode
+                if ($VerbosePreference -eq 'Continue') {
+                    Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level ERROR -Console
+                }
+                
+                # Check for any recent error log files
+                $recentErrorLogs = Get-ChildItem -Path $LogDir -Filter "signing_error_*.txt" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                if ($recentErrorLogs) {
+                    Write-Log "Recent error log available: $($recentErrorLogs.FullName)" -Level ERROR -Console
+                    $errorDetails["ErrorLogFile"] = $recentErrorLogs.FullName
+                }
+                
                 $stats.Failed++
                 continue
             }
@@ -1305,6 +1485,9 @@ Process {
     finally {
         if (Test-Path "$LogDir\stderr.txt") { Remove-Item "$LogDir\stderr.txt" -Force }
         $env:AZURE_KEYVAULT_SECRET = $null
+        
+        # Show error log summary if any errors occurred
+        Show-ErrorLogSummary
     }
 }
 
