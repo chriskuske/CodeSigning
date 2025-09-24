@@ -1105,17 +1105,24 @@ Process {
             
             if ($testResult.ExitCode -ne 0) {
                 # Translate error code for validation failures
-                $errorCodeHex = "0x{0:X8}" -f [uint32]$testResult.ExitCode
+                # Handle both signed and unsigned representations
+                $exitCodeUInt = if ($testResult.ExitCode -lt 0) {
+                    # Convert negative signed int to unsigned int
+                    [uint32]([uint32]::MaxValue + $testResult.ExitCode + 1)
+                } else {
+                    [uint32]$testResult.ExitCode
+                }
+                $errorCodeHex = "0x{0:X8}" -f $exitCodeUInt
                 $validationErrorMsg = ""
                 
-                switch ([uint32]$testResult.ExitCode) {
+                switch ($exitCodeUInt) {
                     0x9FFFB002 { $validationErrorMsg = "Azure Key Vault authentication failed or certificate not found" }
                     0x80070005 { $validationErrorMsg = "Access denied - check service principal permissions" }
                     0x80092009 { $validationErrorMsg = "Certificate '$CertificateName' not found in Key Vault" }
                     0x8009200A { $validationErrorMsg = "Certificate has expired" }
                     default { 
                         try {
-                            $systemMsg = [System.ComponentModel.Win32Exception]::new([int][uint32]$testResult.ExitCode).Message
+                            $systemMsg = [System.ComponentModel.Win32Exception]::new($testResult.ExitCode).Message
                             if ($systemMsg -and $systemMsg -ne "Unknown error") {
                                 $validationErrorMsg = $systemMsg
                             } else {
@@ -1150,7 +1157,7 @@ Process {
                 
                 # Provide specific troubleshooting advice
                 Write-Host "Troubleshooting:" -ForegroundColor Cyan
-                switch ([uint32]$testResult.ExitCode) {
+                switch ($exitCodeUInt) {
                     0x9FFFB002 {
                         Write-Host "  • Verify certificate name: '$CertificateName'" -ForegroundColor Gray
                         Write-Host "  • Check Key Vault permissions for client ID: $($config.ClientId)" -ForegroundColor Gray
@@ -1410,11 +1417,18 @@ Process {
                     
                     if ($process.ExitCode -ne 0) { 
                         # Translate Windows error code to meaningful message
-                        $errorCodeHex = "0x{0:X8}" -f [uint32]$process.ExitCode
+                        # Handle both signed and unsigned representations
+                        $exitCodeUInt = if ($process.ExitCode -lt 0) {
+                            # Convert negative signed int to unsigned int
+                            [uint32]([uint32]::MaxValue + $process.ExitCode + 1)
+                        } else {
+                            [uint32]$process.ExitCode
+                        }
+                        $errorCodeHex = "0x{0:X8}" -f $exitCodeUInt
                         $windowsErrorMsg = ""
                         
                         # Common Windows error codes for signing operations
-                        switch ([uint32]$process.ExitCode) {
+                        switch ($exitCodeUInt) {
                             0x80070005 { $windowsErrorMsg = "Access Denied - Insufficient permissions" }
                             0x80070020 { $windowsErrorMsg = "File is being used by another process" }
                             0x80092009 { $windowsErrorMsg = "Certificate not found or invalid" }
@@ -1433,7 +1447,7 @@ Process {
                             default { 
                                 # Try to get system error message
                                 try {
-                                    $systemMsg = [System.ComponentModel.Win32Exception]::new([int][uint32]$process.ExitCode).Message
+                                    $systemMsg = [System.ComponentModel.Win32Exception]::new($process.ExitCode).Message
                                     if ($systemMsg -and $systemMsg -ne "Unknown error") {
                                         $windowsErrorMsg = $systemMsg
                                     }
@@ -1525,7 +1539,7 @@ Process {
                         
                         # Add troubleshooting suggestions
                         $errorOutput += "=== Troubleshooting Suggestions ==="
-                        switch ([uint32]$process.ExitCode) {
+                        switch ($exitCodeUInt) {
                             0x9FFFB002 {
                                 $errorOutput += "• Verify Azure Key Vault permissions for the service principal"
                                 $errorOutput += "• Check that the certificate name '$CertificateName' exists in Key Vault"
