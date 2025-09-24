@@ -1104,22 +1104,68 @@ Process {
             }
             
             if ($testResult.ExitCode -ne 0) {
+                # Translate error code for validation failures
+                $errorCodeHex = "0x{0:X8}" -f [uint32]$testResult.ExitCode
+                $validationErrorMsg = ""
+                
+                switch ([uint32]$testResult.ExitCode) {
+                    0x9FFFB002 { $validationErrorMsg = "Azure Key Vault authentication failed or certificate not found" }
+                    0x80070005 { $validationErrorMsg = "Access denied - check service principal permissions" }
+                    0x80092009 { $validationErrorMsg = "Certificate '$CertificateName' not found in Key Vault" }
+                    0x8009200A { $validationErrorMsg = "Certificate has expired" }
+                    default { 
+                        try {
+                            $systemMsg = [System.ComponentModel.Win32Exception]::new([int][uint32]$testResult.ExitCode).Message
+                            if ($systemMsg -and $systemMsg -ne "Unknown error") {
+                                $validationErrorMsg = $systemMsg
+                            } else {
+                                $validationErrorMsg = "Unknown validation error"
+                            }
+                        } catch {
+                            $validationErrorMsg = "Unknown validation error"
+                        }
+                    }
+                }
+                
                 # Display detailed validation error information
-                Write-Host "Certificate validation failed with exit code: $($testResult.ExitCode)" -ForegroundColor Red
+                Write-Host "Certificate validation failed!" -ForegroundColor Red
+                Write-Host "Exit Code: $($testResult.ExitCode) ($errorCodeHex)" -ForegroundColor Red
+                Write-Host "Description: $validationErrorMsg" -ForegroundColor Red
+                Write-Host "Certificate: $CertificateName" -ForegroundColor Red
+                Write-Host "Key Vault: $($config.KeyVaultUrl)" -ForegroundColor Red
                 
                 if ($stderrContent) {
                     Write-Host "Error Output:" -ForegroundColor Red
                     Write-Host $stderrContent -ForegroundColor Red
+                } else {
+                    Write-Host "Error Output: (No error output captured)" -ForegroundColor Yellow
                 }
                 
                 if ($stdoutContent) {
                     Write-Host "Standard Output:" -ForegroundColor Yellow
                     Write-Host $stdoutContent -ForegroundColor Yellow
+                } else {
+                    Write-Host "Standard Output: (No output captured)" -ForegroundColor Yellow
                 }
                 
-                $errorMessage = "AzureSignTool validation failed with exit code: $($testResult.ExitCode)"
+                # Provide specific troubleshooting advice
+                Write-Host "Troubleshooting:" -ForegroundColor Cyan
+                switch ([uint32]$testResult.ExitCode) {
+                    0x9FFFB002 {
+                        Write-Host "  • Verify certificate name: '$CertificateName'" -ForegroundColor Gray
+                        Write-Host "  • Check Key Vault permissions for client ID: $($config.ClientId)" -ForegroundColor Gray
+                        Write-Host "  • Ensure AZURE_KEYVAULT_SECRET is correct" -ForegroundColor Gray
+                    }
+                    default {
+                        Write-Host "  • Verify certificate exists in Key Vault" -ForegroundColor Gray
+                        Write-Host "  • Check service principal permissions" -ForegroundColor Gray
+                        Write-Host "  • Ensure proper network access to Azure" -ForegroundColor Gray
+                    }
+                }
+                
+                $errorMessage = "AzureSignTool validation failed with exit code: $($testResult.ExitCode) ($errorCodeHex) - $validationErrorMsg"
                 if ($stderrContent) {
-                    $errorMessage += ". Error: $stderrContent"
+                    $errorMessage += ". Error details: $stderrContent"
                 }
                 
                 throw $errorMessage
@@ -1363,32 +1409,160 @@ Process {
                     $process.WaitForExit()
                     
                     if ($process.ExitCode -ne 0) { 
+                        # Translate Windows error code to meaningful message
+                        $errorCodeHex = "0x{0:X8}" -f [uint32]$process.ExitCode
+                        $windowsErrorMsg = ""
+                        
+                        # Common Windows error codes for signing operations
+                        switch ([uint32]$process.ExitCode) {
+                            0x80070005 { $windowsErrorMsg = "Access Denied - Insufficient permissions" }
+                            0x80070020 { $windowsErrorMsg = "File is being used by another process" }
+                            0x80092009 { $windowsErrorMsg = "Certificate not found or invalid" }
+                            0x8009200A { $windowsErrorMsg = "Certificate has expired" }
+                            0x8009200B { $windowsErrorMsg = "Certificate not yet valid" }
+                            0x80092010 { $windowsErrorMsg = "Certificate chain could not be built" }
+                            0x80096001 { $windowsErrorMsg = "Trust provider is not recognized or configured" }
+                            0x80096002 { $windowsErrorMsg = "Trust provider does not support the specified action" }
+                            0x80096004 { $windowsErrorMsg = "Subject is not trusted for the specified operation" }
+                            0x80096010 { $windowsErrorMsg = "Certificate signature could not be verified" }
+                            0x800B0001 { $windowsErrorMsg = "Trust provider is not recognized" }
+                            0x800B0100 { $windowsErrorMsg = "Certificate is revoked" }
+                            0x800B0101 { $windowsErrorMsg = "Certificate or signature could not be verified" }
+                            0x800B0109 { $windowsErrorMsg = "Root certificate is not trusted" }
+                            0x9FFFB002 { $windowsErrorMsg = "Azure Key Vault authentication or access error" }
+                            default { 
+                                # Try to get system error message
+                                try {
+                                    $systemMsg = [System.ComponentModel.Win32Exception]::new([int][uint32]$process.ExitCode).Message
+                                    if ($systemMsg -and $systemMsg -ne "Unknown error") {
+                                        $windowsErrorMsg = $systemMsg
+                                    }
+                                } catch {
+                                    $windowsErrorMsg = "Unknown error - check AzureSignTool documentation"
+                                }
+                            }
+                        }
+                        
+                        # Additional diagnostic checks
+                        $diagnostics = @()
+                        
+                        # Check file accessibility
+                        try {
+                            $fileInfo = Get-Item $file.FullName -ErrorAction Stop
+                            if ($fileInfo.IsReadOnly) {
+                                $diagnostics += "WARNING: File is marked as read-only"
+                            }
+                            if ($fileInfo.Length -eq 0) {
+                                $diagnostics += "WARNING: File is empty (0 bytes)"
+                            }
+                        } catch {
+                            $diagnostics += "ERROR: Cannot access file - $($_.Exception.Message)"
+                        }
+                        
+                        # Check for file locks
+                        try {
+                            $fileStream = [System.IO.File]::Open($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+                            $fileStream.Close()
+                        } catch {
+                            $diagnostics += "WARNING: File may be locked by another process"
+                        }
+                        
+                        # Check certificate expiry (if we have access to it)
+                        $certDiagnostic = ""
+                        try {
+                            # This is a basic check - in production you'd query Key Vault directly
+                            if ($CertificateName) {
+                                $certDiagnostic = "Certificate: $CertificateName (check expiry in Azure Key Vault)"
+                            }
+                        } catch {
+                            # Ignore certificate check errors
+                        }
+                        
                         # Log both stdout and stderr for debugging
                         $errorLogFile = "$LogDir\signing_error_$([DateTime]::Now.ToString('yyyyMMdd_HHmmss')).txt"
                         $errorOutput = @()
                         $errorOutput += "=== AzureSignTool Error Details ==="
-                        $errorOutput += "Exit Code: $($process.ExitCode)"
+                        $errorOutput += "Exit Code: $($process.ExitCode) ($errorCodeHex)"
+                        $errorOutput += "Error Description: $windowsErrorMsg"
                         $errorOutput += "File: $($file.FullName)"
+                        $errorOutput += "File Size: $([math]::Round($file.Length / 1MB, 2)) MB"
+                        $errorOutput += "File Extension: $($file.Extension)"
+                        if ($certDiagnostic) {
+                            $errorOutput += $certDiagnostic
+                        }
                         $errorOutput += "Command: $($processStartInfo.FileName) $($processStartInfo.Arguments)"
+                        $errorOutput += "Working Directory: $(Get-Location)"
+                        $errorOutput += "User: $env:USERNAME@$env:USERDOMAIN"
+                        $errorOutput += "Computer: $env:COMPUTERNAME"
                         $errorOutput += "Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
                         $errorOutput += ""
+                        
+                        if ($diagnostics) {
+                            $errorOutput += "=== Diagnostic Information ==="
+                            $errorOutput += $diagnostics
+                            $errorOutput += ""
+                        }
+                        
                         if ($stdout) {
                             $errorOutput += "=== Standard Output ==="
                             $errorOutput += $stdout
                             $errorOutput += ""
+                        } else {
+                            $errorOutput += "=== Standard Output ==="
+                            $errorOutput += "(No output captured)"
+                            $errorOutput += ""
                         }
+                        
                         if ($stderr) {
                             $errorOutput += "=== Standard Error ==="
                             $errorOutput += $stderr
                             $errorOutput += ""
+                        } else {
+                            $errorOutput += "=== Standard Error ==="
+                            $errorOutput += "(No error output captured)"
+                            $errorOutput += ""
                         }
+                        
+                        # Add troubleshooting suggestions
+                        $errorOutput += "=== Troubleshooting Suggestions ==="
+                        switch ([uint32]$process.ExitCode) {
+                            0x9FFFB002 {
+                                $errorOutput += "• Verify Azure Key Vault permissions for the service principal"
+                                $errorOutput += "• Check that the certificate name '$CertificateName' exists in Key Vault"
+                                $errorOutput += "• Ensure AZURE_KEYVAULT_SECRET environment variable is set correctly"
+                                $errorOutput += "• Verify network connectivity to Azure Key Vault"
+                            }
+                            0x80070005 {
+                                $errorOutput += "• Run as Administrator or check file/directory permissions"
+                                $errorOutput += "• Ensure the signing account has access to the file"
+                            }
+                            0x80070020 {
+                                $errorOutput += "• Close any applications that might be using the file"
+                                $errorOutput += "• Check for antivirus or backup software locking the file"
+                            }
+                            default {
+                                $errorOutput += "• Check AzureSignTool documentation for exit code $($process.ExitCode)"
+                                $errorOutput += "• Verify certificate is valid and not expired"
+                                $errorOutput += "• Ensure proper Azure Key Vault configuration"
+                            }
+                        }
+                        $errorOutput += ""
                         
                         # Write to error log file
                         $errorOutput | Out-File $errorLogFile -Encoding UTF8
                         
-                        # Display error details to console
+                        # Display enhanced error details to console
                         Write-Host "AzureSignTool Error Details:" -ForegroundColor Red
-                        Write-Host "Exit Code: $($process.ExitCode)" -ForegroundColor Red
+                        Write-Host "Exit Code: $($process.ExitCode) ($errorCodeHex)" -ForegroundColor Red
+                        Write-Host "Description: $windowsErrorMsg" -ForegroundColor Red
+                        
+                        if ($diagnostics) {
+                            Write-Host "Diagnostics:" -ForegroundColor Yellow
+                            foreach ($diag in $diagnostics) {
+                                Write-Host "  $diag" -ForegroundColor Yellow
+                            }
+                        }
+                        
                         if ($stderr) {
                             Write-Host "Error Output:" -ForegroundColor Red
                             Write-Host $stderr -ForegroundColor Red
@@ -1397,9 +1571,11 @@ Process {
                             Write-Host "Standard Output:" -ForegroundColor Yellow
                             Write-Host $stdout -ForegroundColor Yellow
                         }
+                        
                         Write-Host "Full error details saved to: $errorLogFile" -ForegroundColor Yellow
                         
-                        throw "AzureSignTool signing failed with exit code $($process.ExitCode). See error details above or check $errorLogFile for complete information."
+                        $enhancedErrorMsg = "AzureSignTool signing failed with exit code $($process.ExitCode) ($errorCodeHex): $windowsErrorMsg"
+                        throw $enhancedErrorMsg
                     }
                     
                     # Enhanced signature verification with structured SIEM logging
