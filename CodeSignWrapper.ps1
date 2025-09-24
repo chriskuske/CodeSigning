@@ -93,6 +93,46 @@ Begin {
     $ErrorActionPreference = "Stop"
     Set-StrictMode -Version Latest
     
+    function Show-ErrorLogSummary {
+        <#
+        .SYNOPSIS
+            Shows a summary of any error log files created during the signing process
+        .DESCRIPTION
+            Checks for recent error log files in the log directory and displays information
+            about where to find detailed error information if signing failures occurred
+        #>
+        
+        # Check for recent error log files (within last 5 minutes)
+        $cutoffTime = (Get-Date).AddMinutes(-5)
+        $recentErrorLogs = Get-ChildItem -Path $LogDir -Filter "*_error_*.txt" -ErrorAction SilentlyContinue | 
+                           Where-Object { $_.LastWriteTime -ge $cutoffTime } | 
+                           Sort-Object LastWriteTime -Descending
+        
+        if ($recentErrorLogs) {
+            Write-Host "`n" + ("=" * 60) -ForegroundColor Red
+            Write-Host "ERROR LOG SUMMARY" -ForegroundColor Red
+            Write-Host ("=" * 60) -ForegroundColor Red
+            Write-Host "The following error logs were generated during this signing operation:" -ForegroundColor Yellow
+            Write-Host ""
+            
+            foreach ($logFile in $recentErrorLogs) {
+                Write-Host "  • $($logFile.Name)" -ForegroundColor White
+                Write-Host "    Created: $($logFile.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor Gray
+                Write-Host "    Size: $([math]::Round($logFile.Length / 1KB, 2)) KB" -ForegroundColor Gray
+                Write-Host "    Path: $($logFile.FullName)" -ForegroundColor Gray
+                Write-Host ""
+            }
+            
+            Write-Host "These files contain detailed error information including:" -ForegroundColor Yellow
+            Write-Host "  • Complete command-line arguments used" -ForegroundColor Gray
+            Write-Host "  • Full standard output and error streams" -ForegroundColor Gray
+            Write-Host "  • Exit codes and timestamps" -ForegroundColor Gray
+            Write-Host ""
+            Write-Host "Please review these files for detailed troubleshooting information." -ForegroundColor Yellow
+            Write-Host ("=" * 60) -ForegroundColor Red
+        }
+    }
+    
     # Ensure script can find its dependencies regardless of where it's run from
     $scriptPath = $MyInvocation.MyCommand.Path
     $scriptDir = Split-Path -Parent $scriptPath
@@ -1547,46 +1587,6 @@ End {
     
     Write-Host "+$border+" -ForegroundColor Cyan
     Write-Host "`nTip: To update AzureSignTool or Cosign, delete the .exe file in the script directory and rerun this script." -ForegroundColor Gray
-}
-
-function Show-ErrorLogSummary {
-    <#
-    .SYNOPSIS
-        Shows a summary of any error log files created during the signing process
-    .DESCRIPTION
-        Checks for recent error log files in the log directory and displays information
-        about where to find detailed error information if signing failures occurred
-    #>
-    
-    # Check for recent error log files (within last 5 minutes)
-    $cutoffTime = (Get-Date).AddMinutes(-5)
-    $recentErrorLogs = Get-ChildItem -Path $LogDir -Filter "*_error_*.txt" -ErrorAction SilentlyContinue | 
-                       Where-Object { $_.LastWriteTime -ge $cutoffTime } | 
-                       Sort-Object LastWriteTime -Descending
-    
-    if ($recentErrorLogs) {
-        Write-Host "`n" + ("=" * 60) -ForegroundColor Red
-        Write-Host "ERROR LOG SUMMARY" -ForegroundColor Red
-        Write-Host ("=" * 60) -ForegroundColor Red
-        Write-Host "The following error logs were generated during this signing operation:" -ForegroundColor Yellow
-        Write-Host ""
-        
-        foreach ($logFile in $recentErrorLogs) {
-            Write-Host "  • $($logFile.Name)" -ForegroundColor White
-            Write-Host "    Created: $($logFile.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor Gray
-            Write-Host "    Size: $([math]::Round($logFile.Length / 1KB, 2)) KB" -ForegroundColor Gray
-            Write-Host "    Path: $($logFile.FullName)" -ForegroundColor Gray
-            Write-Host ""
-        }
-        
-        Write-Host "These files contain detailed error information including:" -ForegroundColor Yellow
-        Write-Host "  • Complete command-line arguments used" -ForegroundColor Gray
-        Write-Host "  • Full standard output and error streams" -ForegroundColor Gray
-        Write-Host "  • Exit codes and timestamps" -ForegroundColor Gray
-        Write-Host ""
-        Write-Host "Please review these files for detailed troubleshooting information." -ForegroundColor Yellow
-        Write-Host ("=" * 60) -ForegroundColor Red
-    }
 }
 
 # SIG # Begin signature block
