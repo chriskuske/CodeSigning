@@ -981,7 +981,7 @@ See README.md for full documentation.
     Write-Log "Validating configuration..." -Console
     $testArgs = @(
         "sign",
-        "--quiet",
+        "--verbose",
         "--continue-on-error",
         "--kvu", $config.KeyVaultUrl,
         "--kvc", $CertificateName,
@@ -990,7 +990,7 @@ See README.md for full documentation.
         "--kvs", $env:AZURE_KEYVAULT_SECRET,
         "--timestamp-rfc3161", $config.TimestampServer,
         "--help",
-        "--quiet"
+        "--verbose"
     )
 
     $configTestResult = Start-Process -FilePath $azureSignToolPath -ArgumentList $testArgs -NoNewWindow -Wait -PassThru -RedirectStandardError "$LogDir\stderr.txt" -RedirectStandardOutput "$LogDir\stdout.txt"
@@ -1070,7 +1070,7 @@ Process {
             # Try to verify with quiet mode
             $testArgs = @(
                 "sign",
-                "--quiet",
+                "--verbose",
                 "--continue-on-error",
                 "--kvu", $config.KeyVaultUrl,
                 "--kvc", $CertificateName,
@@ -1384,7 +1384,7 @@ Process {
                 # In the signing section, update arguments
                 $signArgs = @(
                     "sign",
-                    "--quiet",
+                    "--verbose",
                     "--continue-on-error",
                     "--kvu", $config.KeyVaultUrl,
                     "--kvc", $CertificateName,
