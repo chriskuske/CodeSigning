@@ -333,11 +333,11 @@ Process {
             $filePath = $f.FullName
             if ($PSCmdlet.ShouldProcess($filePath,"Sign")){
                 try {
-                    $args = @("sign","--kvu",$config.KeyVaultUrl,"--kvc",$CertificateName,
+                    $signArgs = @("sign","--kvu",$config.KeyVaultUrl,"--kvc",$CertificateName,
                         "--azure-key-vault-client-id",$config.ClientId,"--azure-key-vault-tenant-id",$config.TenantId,
                         "--kvs",$env:AZURE_KEYVAULT_SECRET,"--timestamp-rfc3161",$config.TimestampServer,
-                        "--quiet","--continue-on-error","--file",$filePath)
-                    $pr = Start-Process -FilePath $azureSignToolPath -ArgumentList $args -NoNewWindow -Wait -PassThru
+                        "--quiet","--continue-on-error",$filePath) #,"--file"
+                    $pr = Start-Process -FilePath $azureSignToolPath -ArgumentList $signArgs -NoNewWindow -Wait -PassThru
                     if ($pr.ExitCode -eq 0){
                         Write-Log "Signed: ${filePath}" -Level SUCCESS -Console
                         $stats.Success++
