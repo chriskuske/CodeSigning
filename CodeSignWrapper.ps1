@@ -1,91 +1,43 @@
 <#
 .SYNOPSIS
     Wrapper script for code signing using Azure Key Vault certificates
-.DESCRIPTION
-    Provides a streamlined interface for code signing PowerShell scripts, executables,
-    and containers using certificates stored in Azure Key Vault. Supports storing 
-    certificate names for quick access and handles all aspects of the signing process.
-.NOTES
-    Created: February 11, 2024
-    Updated: May 27, 2025
-    Author: Matt Mueller (matthew.mueller@teledyne.com)
-    Contributors: Ankit Chahar (ankit.chahar@teledyne.com)
-    Company: Teledyne Technologies Incorporated
-.LINK
-    https://github.com/TeledyneDevOps/CodeSigning
+.EXAMPLES
+    # Direct invocation (recommended)
+    & "C:\Path\To\CodeSignWrapper.ps1" -Path C:\Build\MyApp.exe
+
+    # From repository folder
+    pwsh -File .\CodeSignWrapper.ps1 -Path .\bin\app.exe
+
+    # Dot-sourcing ONLY if you need the helper functions in your session (not required just to sign)
+    . .\CodeSignWrapper.ps1
+    Sign-Code (future exported functions if any)
+
+    IMPORTANT:
+    Do NOT invoke with:
+        . { \TeledyneDevOps\CodeSigning\CodeSignWrapper.ps1 }
+    That syntax creates a script block; the bare path (starting with backslash) is not resolved and causes:
+        The term '\TeledyneDevOps\CodeSigning\CodeSignWrapper.ps1' is not recognized...
 #>
 
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
-    # Path to file or directory to be signed
-    [Parameter(Mandatory=$false, Position=0)]
-    [string]$Path,
-    
-    # File patterns to include for signing - Added .dat and .msm per Ankit's changes
-    [Parameter(Mandatory=$false)]
-    [string[]]$Include = @("*.ps1", "*.psm1", "*.psd1", "*.dll", "*.exe", "*.zip", "*.msi", "*.msix", 
-                         "*.appx", "*.cab", "*.sys", "*.vbs", "*.js", "*.wsf", "*.cat", "*.msp", "*.jar",
-                         "*.container", "*.tar", "*.oci", "*.dat", "*.msm"),
-    
-    # File patterns to exclude from signing
-    [Parameter(Mandatory=$false)]
+    [Parameter(Position=0)] [string]$Path,
+    [string[]]$Include = @("*.ps1","*.psm1","*.psd1","*.dll","*.exe","*.zip","*.msi","*.msix","*.appx","*.cab","*.sys","*.vbs","*.js","*.wsf","*.cat","*.msp","*.jar","*.container","*.tar","*.oci","*.dat","*.msm"),
     [string[]]$Exclude = @(),
-    
-    # Path to configuration file
-    [Parameter(Mandatory=$false)]
     [string]$ConfigPath = "$PSScriptRoot\config.json",
-    
-    # Directory for storing log files
-    [Parameter(Mandatory=$false)]
     [string]$LogDir = "$PSScriptRoot\logs",
-    
-    # Name of certificate to use for signing
-    [Parameter(Mandatory=$false)]
     [string]$CertificateName,
-    
-    # Process directories recursively
-    [Parameter(Mandatory=$false)]
     [switch]$Recurse,
-    
-    # Force signing of already signed files
-    [Parameter(Mandatory=$false)]
     [switch]$Force,
-    
-    # SIEM server address for logging
-    [Parameter(Mandatory=$false)]
+    [switch]$UpdateTools,
     [string]$SIEMServer = "us1-nslb-ecs.tdy.teledyne.com",
-    
-    # SIEM server port for logging
-    [Parameter(Mandatory=$false)]
     [int]$SIEMPort = 11818,
-    
-    # Protocol to use for SIEM logging
-    [Parameter(Mandatory=$false)]
-    [ValidateSet("TCP", "UDP")]
-    [string]$SIEMProtocol = "TCP",
-    
-    # Enable/disable SIEM logging
-    [Parameter(Mandatory=$false)]
+    [ValidateSet("TCP","UDP")] [string]$SIEMProtocol = "TCP",
     [bool]$EnableSIEM = $true,
-    
-    # Remember the selected certificate for future use
-    [Parameter(Mandatory=$false)]
     [switch]$RememberCertificate,
-    
-    # Use Cosign for container signing instead of AzureSignTool
-    [Parameter(Mandatory=$false)]
     [switch]$UseContainerSigning,
-
-    # Show help message
-    [Parameter(Mandatory=$false)]
     [switch]$Help,
-
-    # Show version information
-    [Parameter(Mandatory=$false)]
     [switch]$Version,
-
-    # Dry run mode, show what would be signed
-    [Parameter(Mandatory=$false)]
     [switch]$DryRun,
 
     # Continue processing files even if some fail to sign
@@ -96,16 +48,15 @@ param(
 Begin {
     $ErrorActionPreference = "Stop"
     Set-StrictMode -Version Latest
-    
+    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    $ConfigPath  = Join-Path $scriptDir "config.json"
+    $LogDir      = Join-Path $scriptDir "logs"
+    $credMgrPath = Join-Path $scriptDir "CredentialManager.ps1"
+    $lastUsedCertPath = Join-Path $scriptDir "lastcert.txt"
+    if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+    $LogFile = Join-Path $LogDir ("signing_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+
     function Show-ErrorLogSummary {
-        <#
-        .SYNOPSIS
-            Shows a summary of any error log files created during the signing process
-        .DESCRIPTION
-            Checks for recent error log files in the log directory and displays information
-            about where to find detailed error information if signing failures occurred
-        #>
-        
         # Check for recent error log files (within last 5 minutes)
         $cutoffTime = (Get-Date).AddMinutes(-5)
         $recentErrorLogs = Get-ChildItem -Path $LogDir -Filter "*_error_*.txt" -ErrorAction SilentlyContinue | 
@@ -136,24 +87,7 @@ Begin {
             Write-Host ("=" * 60) -ForegroundColor Red
         }
     }
-    
-    # Ensure script can find its dependencies regardless of where it's run from
-    $scriptPath = $MyInvocation.MyCommand.Path
-    $scriptDir = Split-Path -Parent $scriptPath
-    
-    # Update paths to be relative to script location
-    $ConfigPath = Join-Path $scriptDir "config.json"
-    $LogDir = Join-Path $scriptDir "logs"
-    $credentialManagerPath = Join-Path $scriptDir "CredentialManager.ps1"
-    $lastUsedCertPath = Join-Path $scriptDir "lastcert.txt"
-    
-    # Create directories if they don't exist
-    if (-not (Test-Path $LogDir)) {
-        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
-    }
 
-    # Initialize log file with timestamp
-    $LogFile = Join-Path $LogDir ("signing_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
 
     # Enhanced SIEM logging for better visibility
     function Send-ToSIEM {
@@ -282,36 +216,39 @@ Begin {
         }
     }
 
-    if ($Help) {
-        Write-Host @"
-CodeSignWrapper.ps1 - Sign files and containers using Azure Key Vault certificates
-
+    if ($Help){
+@"
 Usage:
-  .\CodeSignWrapper.ps1 -Path <file|directory> [options]
+  & .\CodeSignWrapper.ps1 -Path <file|dir> [options]
+
+Correct Invocation Examples:
+  & 'C:\GitRepo\CodeSigning\CodeSignWrapper.ps1' -Path C:\Temp\Test.exe
+  pwsh -File .\CodeSignWrapper.ps1 -Path .\dist -Recurse
+  .\CodeSignWrapper.ps1 -Path C:\Pkg\setup.msi
+
+Avoid (incorrect):
+  . { \TeledyneDevOps\CodeSigning\CodeSignWrapper.ps1 }
+    (The braces create a script block and the leading backslash is not a valid drive-qualified path.)
 
 Options:
-  -Include <patterns>         File patterns to include (default: *.ps1, *.exe, etc)
-  -Exclude <patterns>         File patterns to exclude
-  -CertificateName <name>     Use specific certificate
-  -RememberCertificate        Remember last used certificate
-  -Recurse                   Process directories recursively
-  -Force                     Force re-signing of already signed files
-  -UseContainerSigning       Use Cosign for container signing
-  -Help                      Show this help message
-  -Version                   Show script and tool versions
-  -DryRun                    Show what would be signed, but do not sign
-  -ContinueOnError           Continue processing files even if some fail (default: true)
-  -NoContinueOnError         Stop on first signing error (overrides default behavior)
+  -Include / -Exclude
+  -CertificateName <name>  (-RememberCertificate to persist)
+  -Recurse
+  -Force
+  -UpdateTools
+  -UseContainerSigning
+  -DryRun
+  -ContinueOnError         Continue processing files even if some fail (default: true)
+  -Help / -Version
 
-See README.md for full documentation.
-"@
-        exit 0
+Use -DryRun to preview without signing.
+"@ | Write-Host; exit 0
     }
 
-    if ($Version) {
-        Write-Host "CodeSignWrapper.ps1 version 1.3.0"
-        Write-Host "AzureSignTool: v6.0.1"
-        Write-Host "Cosign: v2.2.3"
+    if ($Version){
+        Write-Host "CodeSignWrapper.ps1 version 1.4.0"
+        Write-Host "AzureSignTool v6.0.1"
+        Write-Host "Cosign v2.2.3"
         exit 0
     }
 
