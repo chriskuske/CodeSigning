@@ -1408,21 +1408,100 @@ Process {
                     $processStartInfo.UseShellExecute = $false
                     $processStartInfo.CreateNoWindow = $true
                     
-                    $process = New-Object System.Diagnostics.Process
-                    $process.StartInfo = $processStartInfo
-                    [void]$process.Start()
-                    $stderr = $process.StandardError.ReadToEnd()
-                    $stdout = $process.StandardOutput.ReadToEnd()
-                    $process.WaitForExit()
+                    # Retry logic for specific error codes
+                    $maxRetries = 3
+                    $retryDelay = 5  # seconds
+                    $currentAttempt = 0
+                    $signingSucceeded = $false
+                    $lastError = $null
                     
-                    if ($process.ExitCode -ne 0) { 
+                    while ($currentAttempt -lt $maxRetries -and -not $signingSucceeded) {
+                        $currentAttempt++
+                        
+                        if ($currentAttempt -gt 1) {
+                            Write-Log "Retry attempt $currentAttempt of $maxRetries for file: $($file.Name)" -Level WARN -Console
+                            Start-Sleep -Seconds $retryDelay
+                        }
+                        
+                        try {
+                            $process = New-Object System.Diagnostics.Process
+                            $process.StartInfo = $processStartInfo
+                            [void]$process.Start()
+                            $stderr = $process.StandardError.ReadToEnd()
+                            $stdout = $process.StandardOutput.ReadToEnd()
+                            $process.WaitForExit()
+                            
+                            if ($process.ExitCode -eq 0) {
+                                $signingSucceeded = $true
+                                break
+                            } else {
+                                # Handle both signed and unsigned representations of exit codes
+                                $exitCodeUInt = if ($process.ExitCode -lt 0) {
+                                    [uint32]([uint32]::MaxValue + $process.ExitCode + 1)
+                                } else {
+                                    [uint32]$process.ExitCode
+                                }
+                                
+                                # Check if this is a retryable error
+                                $isRetryableError = $false
+                                switch ($exitCodeUInt) {
+                                    0xA0000002 { 
+                                        $isRetryableError = $true
+                                        $errorDescription = "Azure Key Vault transient authentication error"
+                                    }
+                                    0x9FFFB002 { 
+                                        $isRetryableError = $true
+                                        $errorDescription = "Azure Key Vault access or connectivity error"
+                                    }
+                                    0x80070005 {
+                                        # Access denied - could be transient file lock
+                                        $isRetryableError = $true
+                                        $errorDescription = "Access denied - possible file lock"
+                                    }
+                                    default {
+                                        $isRetryableError = $false
+                                        $errorDescription = "Non-retryable signing error"
+                                    }
+                                }
+                                
+                                $errorCodeHex = "0x{0:X8}" -f $exitCodeUInt
+                                $lastError = @{
+                                    ExitCode = $process.ExitCode
+                                    ExitCodeHex = $errorCodeHex
+                                    Description = $errorDescription
+                                    Stdout = $stdout
+                                    Stderr = $stderr
+                                    IsRetryable = $isRetryableError
+                                }
+                                
+                                if ($isRetryableError -and $currentAttempt -lt $maxRetries) {
+                                    Write-Log "Retryable error $errorCodeHex ($errorDescription) on attempt $currentAttempt. Will retry..." -Level WARN -Console
+                                    continue
+                                } else {
+                                    # Either non-retryable error or max retries exceeded
+                                    break
+                                }
+                            }
+                        } catch {
+                            $lastError = @{
+                                ExitCode = -1
+                                ExitCodeHex = "Exception"
+                                Description = "Process execution failed"
+                                Exception = $_.Exception.Message
+                                IsRetryable = $false
+                            }
+                            break
+                        }
+                    }
+                    
+                    # Handle final result after retry attempts
+                    if (-not $signingSucceeded) {
                         # Translate Windows error code to meaningful message
-                        # Handle both signed and unsigned representations
-                        $exitCodeUInt = if ($process.ExitCode -lt 0) {
+                        $exitCodeUInt = if ($lastError.ExitCode -lt 0 -and $lastError.ExitCode -ne -1) {
                             # Convert negative signed int to unsigned int
-                            [uint32]([uint32]::MaxValue + $process.ExitCode + 1)
+                            [uint32]([uint32]::MaxValue + $lastError.ExitCode + 1)
                         } else {
-                            [uint32]$process.ExitCode
+                            [uint32]$lastError.ExitCode
                         }
                         $errorCodeHex = "0x{0:X8}" -f $exitCodeUInt
                         $windowsErrorMsg = ""
@@ -1443,13 +1522,19 @@ Process {
                             0x800B0100 { $windowsErrorMsg = "Certificate is revoked" }
                             0x800B0101 { $windowsErrorMsg = "Certificate or signature could not be verified" }
                             0x800B0109 { $windowsErrorMsg = "Root certificate is not trusted" }
+                            0x8007000B { $windowsErrorMsg = "Invalid format or data - file may contain UWP components with mismatched publisher identity" }
                             0x9FFFB002 { $windowsErrorMsg = "Azure Key Vault authentication or access error" }
+                            0xA0000002 { $windowsErrorMsg = "Azure Key Vault transient authentication error - all retry attempts failed" }
                             default { 
                                 # Try to get system error message
                                 try {
-                                    $systemMsg = [System.ComponentModel.Win32Exception]::new($process.ExitCode).Message
-                                    if ($systemMsg -and $systemMsg -ne "Unknown error") {
-                                        $windowsErrorMsg = $systemMsg
+                                    if ($lastError.ExitCode -ne -1) {
+                                        $systemMsg = [System.ComponentModel.Win32Exception]::new($lastError.ExitCode).Message
+                                        if ($systemMsg -and $systemMsg -ne "Unknown error") {
+                                            $windowsErrorMsg = $systemMsg
+                                        }
+                                    } else {
+                                        $windowsErrorMsg = $lastError.Exception
                                     }
                                 } catch {
                                     $windowsErrorMsg = "Unknown error - check AzureSignTool documentation"
@@ -1496,8 +1581,14 @@ Process {
                         $errorLogFile = "$LogDir\signing_error_$([DateTime]::Now.ToString('yyyyMMdd_HHmmss')).txt"
                         $errorOutput = @()
                         $errorOutput += "=== AzureSignTool Error Details ==="
-                        $errorOutput += "Exit Code: $($process.ExitCode) ($errorCodeHex)"
+                        $errorOutput += "Exit Code: $($lastError.ExitCode) ($($lastError.ExitCodeHex))"
                         $errorOutput += "Error Description: $windowsErrorMsg"
+                        $errorOutput += "Retry Attempts: $currentAttempt of $maxRetries"
+                        if ($lastError.IsRetryable) {
+                            $errorOutput += "Error Type: Retryable (exhausted all retry attempts)"
+                        } else {
+                            $errorOutput += "Error Type: Non-retryable"
+                        }
                         $errorOutput += "File: $($file.FullName)"
                         $errorOutput += "File Size: $([math]::Round($file.Length / 1MB, 2)) MB"
                         $errorOutput += "File Extension: $($file.Extension)"
@@ -1517,9 +1608,9 @@ Process {
                             $errorOutput += ""
                         }
                         
-                        if ($stdout) {
+                        if ($lastError.Stdout) {
                             $errorOutput += "=== Standard Output ==="
-                            $errorOutput += $stdout
+                            $errorOutput += $lastError.Stdout
                             $errorOutput += ""
                         } else {
                             $errorOutput += "=== Standard Output ==="
@@ -1527,9 +1618,9 @@ Process {
                             $errorOutput += ""
                         }
                         
-                        if ($stderr) {
+                        if ($lastError.Stderr) {
                             $errorOutput += "=== Standard Error ==="
-                            $errorOutput += $stderr
+                            $errorOutput += $lastError.Stderr
                             $errorOutput += ""
                         } else {
                             $errorOutput += "=== Standard Error ==="
@@ -1540,6 +1631,20 @@ Process {
                         # Add troubleshooting suggestions
                         $errorOutput += "=== Troubleshooting Suggestions ==="
                         switch ($exitCodeUInt) {
+                            0xA0000002 {
+                                $errorOutput += "• Transient Azure Key Vault authentication error (failed after $maxRetries retries)"
+                                $errorOutput += "• Check Azure Key Vault service status and network connectivity"
+                                $errorOutput += "• Verify service principal permissions and certificate access"
+                                $errorOutput += "• Consider increasing retry delay if network latency is high"
+                                $errorOutput += "• Try running the script again - this error is usually temporary"
+                            }
+                            0x8007000B {
+                                $errorOutput += "• MSI contains UWP/APPX components with publisher identity mismatch"
+                                $errorOutput += "• Check AppxManifest.xml Publisher identity matches certificate subject"
+                                $errorOutput += "• Contact development team to fix UWP package publisher identity"
+                                $errorOutput += "• Consider signing individual components separately before packaging"
+                                $errorOutput += "• Verify certificate subject: use 'Get-AuthenticodeSignature' or check Key Vault"
+                            }
                             0x9FFFB002 {
                                 $errorOutput += "• Verify Azure Key Vault permissions for the service principal"
                                 $errorOutput += "• Check that the certificate name '$CertificateName' exists in Key Vault"
@@ -1555,7 +1660,7 @@ Process {
                                 $errorOutput += "• Check for antivirus or backup software locking the file"
                             }
                             default {
-                                $errorOutput += "• Check AzureSignTool documentation for exit code $($process.ExitCode)"
+                                $errorOutput += "• Check AzureSignTool documentation for exit code $($lastError.ExitCode)"
                                 $errorOutput += "• Verify certificate is valid and not expired"
                                 $errorOutput += "• Ensure proper Azure Key Vault configuration"
                             }
@@ -1567,8 +1672,15 @@ Process {
                         
                         # Display enhanced error details to console
                         Write-Host "AzureSignTool Error Details:" -ForegroundColor Red
-                        Write-Host "Exit Code: $($process.ExitCode) ($errorCodeHex)" -ForegroundColor Red
+                        Write-Host "Exit Code: $($lastError.ExitCode) ($($lastError.ExitCodeHex))" -ForegroundColor Red
                         Write-Host "Description: $windowsErrorMsg" -ForegroundColor Red
+                        Write-Host "Retry Attempts: $currentAttempt of $maxRetries" -ForegroundColor Red
+                        
+                        if ($lastError.IsRetryable) {
+                            Write-Host "Error was retryable but all retry attempts failed" -ForegroundColor Red
+                        } else {
+                            Write-Host "Error was not retryable" -ForegroundColor Yellow
+                        }
                         
                         if ($diagnostics) {
                             Write-Host "Diagnostics:" -ForegroundColor Yellow
@@ -1577,18 +1689,18 @@ Process {
                             }
                         }
                         
-                        if ($stderr) {
+                        if ($lastError.Stderr) {
                             Write-Host "Error Output:" -ForegroundColor Red
-                            Write-Host $stderr -ForegroundColor Red
+                            Write-Host $lastError.Stderr -ForegroundColor Red
                         }
-                        if ($stdout) {
+                        if ($lastError.Stdout) {
                             Write-Host "Standard Output:" -ForegroundColor Yellow
-                            Write-Host $stdout -ForegroundColor Yellow
+                            Write-Host $lastError.Stdout -ForegroundColor Yellow
                         }
                         
                         Write-Host "Full error details saved to: $errorLogFile" -ForegroundColor Yellow
                         
-                        $enhancedErrorMsg = "AzureSignTool signing failed with exit code $($process.ExitCode) ($errorCodeHex): $windowsErrorMsg"
+                        $enhancedErrorMsg = "AzureSignTool signing failed after $currentAttempt attempts with exit code $($lastError.ExitCode) ($($lastError.ExitCodeHex)): $windowsErrorMsg"
                         throw $enhancedErrorMsg
                     }
                     
