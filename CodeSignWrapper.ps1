@@ -1391,9 +1391,9 @@ Process {
                     "--azure-key-vault-client-id", $config.ClientId,
                     "--azure-key-vault-tenant-id", $config.TenantId,
                     "--kvs", $env:AZURE_KEYVAULT_SECRET,
-                    "--timestamp-rfc3161", $config.TimestampServer,
                     "--colors"
                 )
+                #                     "--timestamp-rfc3161", $config.TimestampServer,
                 
                 # Add any file-specific parameters
                 $signArgs += $additionalParams
