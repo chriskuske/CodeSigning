@@ -1442,25 +1442,61 @@ Process {
                                     [uint32]$process.ExitCode
                                 }
                                 
+                                # Check stdout for actual Windows error codes (AzureSignTool wraps them)
+                                $actualWindowsError = $null
+                                if ($stdout -match "Signing failed with error ([0-9A-Fa-f]+)") {
+                                    $actualWindowsError = "0x" + $matches[1]
+                                }
+                                
                                 # Check if this is a retryable error
                                 $isRetryableError = $false
-                                switch ($exitCodeUInt) {
-                                    0xA0000002 { 
-                                        $isRetryableError = $true
-                                        $errorDescription = "Azure Key Vault transient authentication error"
+                                $errorDescription = "Non-retryable signing error"
+                                
+                                # First check the actual Windows error code from the verbose output
+                                if ($actualWindowsError) {
+                                    switch ($actualWindowsError.ToUpper()) {
+                                        "0x8007000B" { 
+                                            $isRetryableError = $true
+                                            $errorDescription = "UWP Publisher identity mismatch - retrying in case of transient issue"
+                                        }
+                                        "0x80070005" {
+                                            $isRetryableError = $true
+                                            $errorDescription = "Access denied - possible file lock"
+                                        }
+                                        default {
+                                            # Check if it's a known retryable pattern
+                                            if ($actualWindowsError -match "0x9FFFB.*|0xA0000.*") {
+                                                $isRetryableError = $true
+                                                $errorDescription = "Azure Key Vault transient error"
+                                            }
+                                        }
                                     }
-                                    0x9FFFB002 { 
-                                        $isRetryableError = $true
-                                        $errorDescription = "Azure Key Vault access or connectivity error"
-                                    }
-                                    0x80070005 {
-                                        # Access denied - could be transient file lock
-                                        $isRetryableError = $true
-                                        $errorDescription = "Access denied - possible file lock"
-                                    }
-                                    default {
-                                        $isRetryableError = $false
-                                        $errorDescription = "Non-retryable signing error"
+                                } else {
+                                    # Fall back to checking the AzureSignTool exit code
+                                    switch ($exitCodeUInt) {
+                                        0xA0000002 { 
+                                            # This could be Azure auth error OR wrapped UWP error
+                                            # Check stdout for UWP-related messages
+                                            if ($stdout -match "Publisher Identity.*does not match|AppxManifest") {
+                                                $isRetryableError = $true
+                                                $errorDescription = "UWP Publisher identity mismatch (wrapped) - retrying in case of transient issue"
+                                            } else {
+                                                $isRetryableError = $true
+                                                $errorDescription = "Azure Key Vault transient authentication error"
+                                            }
+                                        }
+                                        0x9FFFB002 { 
+                                            $isRetryableError = $true
+                                            $errorDescription = "Azure Key Vault access or connectivity error"
+                                        }
+                                        0x80070005 {
+                                            $isRetryableError = $true
+                                            $errorDescription = "Access denied - possible file lock"
+                                        }
+                                        default {
+                                            $isRetryableError = $false
+                                            $errorDescription = "Non-retryable signing error"
+                                        }
                                     }
                                 }
                                 
@@ -1468,6 +1504,7 @@ Process {
                                 $lastError = @{
                                     ExitCode = $process.ExitCode
                                     ExitCodeHex = $errorCodeHex
+                                    ActualWindowsError = $actualWindowsError
                                     Description = $errorDescription
                                     Stdout = $stdout
                                     Stderr = $stderr
@@ -1507,37 +1544,71 @@ Process {
                         $windowsErrorMsg = ""
                         
                         # Common Windows error codes for signing operations
-                        switch ($exitCodeUInt) {
-                            0x80070005 { $windowsErrorMsg = "Access Denied - Insufficient permissions" }
-                            0x80070020 { $windowsErrorMsg = "File is being used by another process" }
-                            0x80092009 { $windowsErrorMsg = "Certificate not found or invalid" }
-                            0x8009200A { $windowsErrorMsg = "Certificate has expired" }
-                            0x8009200B { $windowsErrorMsg = "Certificate not yet valid" }
-                            0x80092010 { $windowsErrorMsg = "Certificate chain could not be built" }
-                            0x80096001 { $windowsErrorMsg = "Trust provider is not recognized or configured" }
-                            0x80096002 { $windowsErrorMsg = "Trust provider does not support the specified action" }
-                            0x80096004 { $windowsErrorMsg = "Subject is not trusted for the specified operation" }
-                            0x80096010 { $windowsErrorMsg = "Certificate signature could not be verified" }
-                            0x800B0001 { $windowsErrorMsg = "Trust provider is not recognized" }
-                            0x800B0100 { $windowsErrorMsg = "Certificate is revoked" }
-                            0x800B0101 { $windowsErrorMsg = "Certificate or signature could not be verified" }
-                            0x800B0109 { $windowsErrorMsg = "Root certificate is not trusted" }
-                            0x8007000B { $windowsErrorMsg = "Invalid format or data - file may contain UWP components with mismatched publisher identity" }
-                            0x9FFFB002 { $windowsErrorMsg = "Azure Key Vault authentication or access error" }
-                            0xA0000002 { $windowsErrorMsg = "Azure Key Vault transient authentication error - all retry attempts failed" }
-                            default { 
-                                # Try to get system error message
-                                try {
-                                    if ($lastError.ExitCode -ne -1) {
-                                        $systemMsg = [System.ComponentModel.Win32Exception]::new($lastError.ExitCode).Message
-                                        if ($systemMsg -and $systemMsg -ne "Unknown error") {
-                                            $windowsErrorMsg = $systemMsg
-                                        }
+                        if ($lastError.ActualWindowsError) {
+                            # Use actual Windows error code for lookup
+                            switch ($lastError.ActualWindowsError.ToUpper()) {
+                                "0x8007000B" { $windowsErrorMsg = "UWP Publisher Identity mismatch (retried $currentAttempt times) - AppxManifest.xml Publisher does not match certificate subject" }
+                                "0x80070005" { $windowsErrorMsg = "Access Denied - Insufficient permissions" }
+                                "0x80070020" { $windowsErrorMsg = "File is being used by another process" }
+                                "0x80092009" { $windowsErrorMsg = "Certificate not found or invalid" }
+                                "0x8009200A" { $windowsErrorMsg = "Certificate has expired" }
+                                "0x8009200B" { $windowsErrorMsg = "Certificate not yet valid" }
+                                "0x80092010" { $windowsErrorMsg = "Certificate chain could not be built" }
+                                "0x80096001" { $windowsErrorMsg = "Trust provider is not recognized or configured" }
+                                "0x80096002" { $windowsErrorMsg = "Trust provider does not support the specified action" }
+                                "0x80096004" { $windowsErrorMsg = "Subject is not trusted for the specified operation" }
+                                "0x80096010" { $windowsErrorMsg = "Certificate signature could not be verified" }
+                                "0x800B0001" { $windowsErrorMsg = "Trust provider is not recognized" }
+                                "0x800B0100" { $windowsErrorMsg = "Certificate is revoked" }
+                                "0x800B0101" { $windowsErrorMsg = "Certificate or signature could not be verified" }
+                                "0x800B0109" { $windowsErrorMsg = "Root certificate is not trusted" }
+                                default { $windowsErrorMsg = $lastError.Description }
+                            }
+                        } else {
+                            # Use AzureSignTool exit code for lookup
+                            switch ($exitCodeUInt) {
+                                0x80070005 { $windowsErrorMsg = "Access Denied - Insufficient permissions" }
+                                0x80070020 { $windowsErrorMsg = "File is being used by another process" }
+                                0x80092009 { $windowsErrorMsg = "Certificate not found or invalid" }
+                                0x8009200A { $windowsErrorMsg = "Certificate has expired" }
+                                0x8009200B { $windowsErrorMsg = "Certificate not yet valid" }
+                                0x80092010 { $windowsErrorMsg = "Certificate chain could not be built" }
+                                0x80096001 { $windowsErrorMsg = "Trust provider is not recognized or configured" }
+                                0x80096002 { $windowsErrorMsg = "Trust provider does not support the specified action" }
+                                0x80096004 { $windowsErrorMsg = "Subject is not trusted for the specified operation" }
+                                0x80096010 { $windowsErrorMsg = "Certificate signature could not be verified" }
+                                0x800B0001 { $windowsErrorMsg = "Trust provider is not recognized" }
+                                0x800B0100 { $windowsErrorMsg = "Certificate is revoked" }
+                                0x800B0101 { $windowsErrorMsg = "Certificate or signature could not be verified" }
+                                0x800B0109 { $windowsErrorMsg = "Root certificate is not trusted" }
+                                0x8007000B { $windowsErrorMsg = "Invalid format or data (retried $currentAttempt times) - file may contain UWP components with mismatched publisher identity" }
+                                0x9FFFB002 { $windowsErrorMsg = "Azure Key Vault authentication or access error (retried $currentAttempt times)" }
+                                0xA0000002 { 
+                                    # Check if this is actually a UWP error wrapped by AzureSignTool
+                                    if ($lastError.Stdout -match "Publisher Identity.*does not match|AppxManifest") {
+                                        $windowsErrorMsg = "UWP Publisher Identity mismatch (wrapped by AzureSignTool, retried $currentAttempt times)"
                                     } else {
-                                        $windowsErrorMsg = $lastError.Exception
+                                        $windowsErrorMsg = "Azure Key Vault transient authentication error - all $currentAttempt retry attempts failed"
                                     }
-                                } catch {
-                                    $windowsErrorMsg = "Unknown error - check AzureSignTool documentation"
+                                }
+                                default { 
+                                    # Try to get system error message or use description from retry logic
+                                    if ($lastError.Description -ne "Non-retryable signing error") {
+                                        $windowsErrorMsg = $lastError.Description
+                                    } else {
+                                        try {
+                                            if ($lastError.ExitCode -ne -1) {
+                                                $systemMsg = [System.ComponentModel.Win32Exception]::new($lastError.ExitCode).Message
+                                                if ($systemMsg -and $systemMsg -ne "Unknown error") {
+                                                    $windowsErrorMsg = $systemMsg
+                                                }
+                                            } else {
+                                                $windowsErrorMsg = $lastError.Exception
+                                            }
+                                        } catch {
+                                            $windowsErrorMsg = "Unknown error - check AzureSignTool documentation"
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1581,7 +1652,10 @@ Process {
                         $errorLogFile = "$LogDir\signing_error_$([DateTime]::Now.ToString('yyyyMMdd_HHmmss')).txt"
                         $errorOutput = @()
                         $errorOutput += "=== AzureSignTool Error Details ==="
-                        $errorOutput += "Exit Code: $($lastError.ExitCode) ($($lastError.ExitCodeHex))"
+                        $errorOutput += "AzureSignTool Exit Code: $($lastError.ExitCode) ($($lastError.ExitCodeHex))"
+                        if ($lastError.ActualWindowsError) {
+                            $errorOutput += "Actual Windows Error Code: $($lastError.ActualWindowsError)"
+                        }
                         $errorOutput += "Error Description: $windowsErrorMsg"
                         $errorOutput += "Retry Attempts: $currentAttempt of $maxRetries"
                         if ($lastError.IsRetryable) {
@@ -1630,32 +1704,50 @@ Process {
                         
                         # Add troubleshooting suggestions
                         $errorOutput += "=== Troubleshooting Suggestions ==="
-                        switch ($exitCodeUInt) {
-                            0xA0000002 {
-                                $errorOutput += "• Transient Azure Key Vault authentication error (failed after $maxRetries retries)"
-                                $errorOutput += "• Check Azure Key Vault service status and network connectivity"
-                                $errorOutput += "• Verify service principal permissions and certificate access"
-                                $errorOutput += "• Consider increasing retry delay if network latency is high"
-                                $errorOutput += "• Try running the script again - this error is usually temporary"
-                            }
-                            0x8007000B {
+                        
+                        # Use actual Windows error code for troubleshooting if available
+                        $troubleshootingCode = if ($lastError.ActualWindowsError) { 
+                            $lastError.ActualWindowsError.ToUpper() 
+                        } else { 
+                            "0x{0:X8}" -f $exitCodeUInt 
+                        }
+                        
+                        switch ($troubleshootingCode) {
+                            "0x8007000B" {
                                 $errorOutput += "• MSI contains UWP/APPX components with publisher identity mismatch"
-                                $errorOutput += "• Check AppxManifest.xml Publisher identity matches certificate subject"
-                                $errorOutput += "• Contact development team to fix UWP package publisher identity"
-                                $errorOutput += "• Consider signing individual components separately before packaging"
-                                $errorOutput += "• Verify certificate subject: use 'Get-AuthenticodeSignature' or check Key Vault"
+                                $errorOutput += "• The Publisher in AppxManifest.xml does not match the certificate subject"
+                                $errorOutput += "• This error was retried $maxRetries times before failing"
+                                $errorOutput += "• Contact development team to update AppxManifest.xml Publisher identity"
+                                $errorOutput += "• Publisher should match certificate CN (Common Name)"
+                                $errorOutput += "• Consider signing individual UWP components separately before MSI packaging"
+                                $errorOutput += "• Check certificate subject with: Get-AuthenticodeSignature or Azure Key Vault"
                             }
-                            0x9FFFB002 {
+                            "0xA0000002" {
+                                # Check if this is actually UWP wrapped in AzureSignTool error
+                                if ($lastError.Stdout -match "Publisher Identity.*does not match|AppxManifest") {
+                                    $errorOutput += "• UWP Publisher identity mismatch (wrapped by AzureSignTool)"
+                                    $errorOutput += "• The actual error is UWP Publisher mismatch (0x8007000B)"
+                                    $errorOutput += "• This error was retried $maxRetries times before failing"
+                                    $errorOutput += "• Contact development team to fix AppxManifest.xml Publisher identity"
+                                } else {
+                                    $errorOutput += "• Transient Azure Key Vault authentication error (failed after $maxRetries retries)"
+                                    $errorOutput += "• Check Azure Key Vault service status and network connectivity"
+                                    $errorOutput += "• Verify service principal permissions and certificate access"
+                                    $errorOutput += "• Consider increasing retry delay if network latency is high"
+                                    $errorOutput += "• Try running the script again - this error is usually temporary"
+                                }
+                            }
+                            "0x9FFFB002" {
                                 $errorOutput += "• Verify Azure Key Vault permissions for the service principal"
                                 $errorOutput += "• Check that the certificate name '$CertificateName' exists in Key Vault"
                                 $errorOutput += "• Ensure AZURE_KEYVAULT_SECRET environment variable is set correctly"
                                 $errorOutput += "• Verify network connectivity to Azure Key Vault"
                             }
-                            0x80070005 {
+                            "0x80070005" {
                                 $errorOutput += "• Run as Administrator or check file/directory permissions"
                                 $errorOutput += "• Ensure the signing account has access to the file"
                             }
-                            0x80070020 {
+                            "0x80070020" {
                                 $errorOutput += "• Close any applications that might be using the file"
                                 $errorOutput += "• Check for antivirus or backup software locking the file"
                             }
@@ -1663,6 +1755,9 @@ Process {
                                 $errorOutput += "• Check AzureSignTool documentation for exit code $($lastError.ExitCode)"
                                 $errorOutput += "• Verify certificate is valid and not expired"
                                 $errorOutput += "• Ensure proper Azure Key Vault configuration"
+                                if ($lastError.ActualWindowsError) {
+                                    $errorOutput += "• Look up Windows error code $($lastError.ActualWindowsError) for specific details"
+                                }
                             }
                         }
                         $errorOutput += ""
@@ -1672,7 +1767,10 @@ Process {
                         
                         # Display enhanced error details to console
                         Write-Host "AzureSignTool Error Details:" -ForegroundColor Red
-                        Write-Host "Exit Code: $($lastError.ExitCode) ($($lastError.ExitCodeHex))" -ForegroundColor Red
+                        Write-Host "AzureSignTool Exit Code: $($lastError.ExitCode) ($($lastError.ExitCodeHex))" -ForegroundColor Red
+                        if ($lastError.ActualWindowsError) {
+                            Write-Host "Actual Windows Error: $($lastError.ActualWindowsError)" -ForegroundColor Red
+                        }
                         Write-Host "Description: $windowsErrorMsg" -ForegroundColor Red
                         Write-Host "Retry Attempts: $currentAttempt of $maxRetries" -ForegroundColor Red
                         
