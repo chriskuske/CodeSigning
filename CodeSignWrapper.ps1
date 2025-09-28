@@ -86,7 +86,11 @@ param(
 
     # Dry run mode, show what would be signed
     [Parameter(Mandatory=$false)]
-    [switch]$DryRun
+    [switch]$DryRun,
+
+    # Continue processing files even if some fail to sign
+    [Parameter(Mandatory=$false)]
+    [switch]$ContinueOnError = $true
 )
 
 Begin {
@@ -296,6 +300,8 @@ Options:
   -Help                      Show this help message
   -Version                   Show script and tool versions
   -DryRun                    Show what would be signed, but do not sign
+  -ContinueOnError           Continue processing files even if some fail (default: true)
+  -NoContinueOnError         Stop on first signing error (overrides default behavior)
 
 See README.md for full documentation.
 "@
@@ -1384,8 +1390,15 @@ Process {
                 # In the signing section, update arguments
                 $signArgs = @(
                     "sign",
-                    "--verbose",
-                    "--continue-on-error",
+                    "--verbose"
+                )
+                
+                # Only add continue-on-error if the parameter is set to true
+                if ($ContinueOnError) {
+                    $signArgs += "--continue-on-error"
+                }
+                
+                $signArgs += @(
                     "--kvu", $config.KeyVaultUrl,
                     "--kvc", $CertificateName,
                     "--azure-key-vault-client-id", $config.ClientId,
@@ -1409,7 +1422,7 @@ Process {
                     $processStartInfo.CreateNoWindow = $true
                     
                     # Retry logic for specific error codes
-                    $maxRetries = 5
+                    $maxRetries = 10
                     $retryDelay = 5  # seconds
                     $currentAttempt = 0
                     $signingSucceeded = $false
@@ -1901,6 +1914,13 @@ Process {
                 }
                 
                 $stats.Failed++
+                
+                # Check if we should continue on errors
+                if (-not $ContinueOnError) {
+                    Write-Log "ContinueOnError is disabled. Stopping execution due to signing failure." -Level ERROR -Console
+                    throw "Signing failed for file '$($file.Name)' and ContinueOnError is disabled. Stopping execution."
+                }
+                
                 continue
             }
         }
