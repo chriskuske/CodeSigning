@@ -1409,7 +1409,7 @@ Process {
                     $processStartInfo.CreateNoWindow = $true
                     
                     # Retry logic for specific error codes
-                    $maxRetries = 3
+                    $maxRetries = 5
                     $retryDelay = 5  # seconds
                     $currentAttempt = 0
                     $signingSucceeded = $false
@@ -1463,10 +1463,6 @@ Process {
                                             $isRetryableError = $true
                                             $errorDescription = "Access denied - possible file lock"
                                         }
-                                        "0x800B0003" {
-                                            $isRetryableError = $true
-                                            $errorDescription = "Trust provider not known - retrying as this can be transient"
-                                        }
                                         "0x800B0001" {
                                             $isRetryableError = $true
                                             $errorDescription = "Trust provider not recognized - retrying as this can be transient"
@@ -1477,7 +1473,7 @@ Process {
                                         }
                                         default {
                                             # Check if it's a known retryable pattern
-                                            if ($actualWindowsError -match "0x9FFFB.*|0xA0000.*|0x800B00.*") {
+                                            if ($actualWindowsError -match "0x9FFFB.*|0xA0000.*|0x800B0001") {
                                                 $isRetryableError = $true
                                                 $errorDescription = "Transient signing/authentication error"
                                             }
@@ -1571,7 +1567,7 @@ Process {
                                 "0x80096004" { $windowsErrorMsg = "Subject is not trusted for the specified operation" }
                                 "0x80096010" { $windowsErrorMsg = "Certificate signature could not be verified" }
                                 "0x800B0001" { $windowsErrorMsg = "Trust provider is not recognized (retried $currentAttempt times)" }
-                                "0x800B0003" { $windowsErrorMsg = "Trust provider is not known on this system (retried $currentAttempt times)" }
+                                "0x800B0003" { $windowsErrorMsg = "Trust provider is not known on this system" }
                                 "0x800B0100" { $windowsErrorMsg = "Certificate is revoked" }
                                 "0x800B0101" { $windowsErrorMsg = "Certificate or signature could not be verified" }
                                 "0x800B0109" { $windowsErrorMsg = "Root certificate is not trusted" }
@@ -1591,7 +1587,7 @@ Process {
                                 0x80096004 { $windowsErrorMsg = "Subject is not trusted for the specified operation" }
                                 0x80096010 { $windowsErrorMsg = "Certificate signature could not be verified" }
                                 0x800B0001 { $windowsErrorMsg = "Trust provider is not recognized (retried $currentAttempt times)" }
-                                0x800B0003 { $windowsErrorMsg = "Trust provider is not known on this system (retried $currentAttempt times)" }
+                                0x800B0003 { $windowsErrorMsg = "Trust provider is not known on this system" }
                                 0x800B0100 { $windowsErrorMsg = "Certificate is revoked" }
                                 0x800B0101 { $windowsErrorMsg = "Certificate or signature could not be verified" }
                                 0x800B0109 { $windowsErrorMsg = "Root certificate is not trusted" }
@@ -1773,12 +1769,13 @@ Process {
                                 $errorOutput += "• Check if antivirus is interfering with cryptographic operations"
                             }
                             "0x800B0003" {
-                                $errorOutput += "• Trust provider is not known on this system (retried $maxRetries times)"
-                                $errorOutput += "• This can be a transient Windows cryptographic service issue"
+                                $errorOutput += "• Trust provider is not known on this system (not retryable)"
+                                $errorOutput += "• This is a Windows cryptographic service configuration issue"
                                 $errorOutput += "• Try restarting the Windows cryptographic services: 'net stop cryptsvc && net start cryptsvc'"
                                 $errorOutput += "• Verify the certificate store is accessible and not corrupted"
                                 $errorOutput += "• Check system date/time - certificate validation is time-sensitive"
                                 $errorOutput += "• Run 'sfc /scannow' to check for Windows system file corruption"
+                                $errorOutput += "• This error typically requires system-level fixes and won't resolve with retries"
                             }
                             default {
                                 $errorOutput += "• Check AzureSignTool documentation for exit code $($lastError.ExitCode)"
